@@ -1,0 +1,111 @@
+# Local development stack: Postgres 16 + qd built from this repo, deployed like
+# production in three roles (one image, different subcommands):
+#
+#   migrate        `qd migrate`: waits for Postgres, applies the migrations, exits 0
+#   scheduler      `qd scheduler`: background maintenance (admin port only)
+#   qd  `qd server`: the SQS API
+#
+# Migrations run first; scheduler and server then start in parallel (both depend only on the
+# migrate service having completed successfully). No process touches the schema before that.
+# For a single all-in-one process instead, run the image without a subcommand
+# (`docker compose run --rm -p 9324:9324 -p 9325:9325 qd all`).
+#
+#   docker compose up --build
+#   curl localhost:9325/readyz       # server admin (/healthz /readyz /metrics)
+#   curl localhost:9326/metrics      # scheduler admin
+#   AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y AWS_DEFAULT_REGION=us-east-1 \
+#     aws --endpoint-url http://localhost:9324 sqs create-queue --queue-name dev
+#
+# Postgres is also published on localhost:5432 (user/password qd/qd) for psql and for
+# `DATABASE_URL=postgres://qd:qd@localhost:5432/qd cargo test`.
+name: qd
+
+# Shared by the three qd services.
+x-qd: &qd
+  build:
+    context: .
+    dockerfile: Dockerfile
+    # The debug variant is the same binary on distroless:debug, which ships busybox
+    # so the healthchecks below can run wget. Production uses the default target.
+    target: runtime-debug
+  image: qd:dev
+  environment: &qd-env
+    QD_DATABASE_URL: postgres://qd:qd@postgres:5432/qd
+    QD_LOG_FORMAT: text
+    QD_LOG: info,sqlx=warn
+  read_only: true
+  security_opt:
+    - no-new-privileges:true
+  cap_drop: [ALL]
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16
+    environment:
+      POSTGRES_USER: qd
+      POSTGRES_PASSWORD: qd
+      POSTGRES_DB: qd
+    command: ["postgres", "-c", "max_connections=200", "-c", "autovacuum_naptime=10s"]
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U qd -d qd"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  migrate:
+    <<: *qd
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+
+  scheduler:
+    <<: *qd
+    command: ["scheduler"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    ports:
+      - "9326:9325" # admin: /healthz /readyz /metrics (queue gauges, janitor, heartbeat)
+    healthcheck:
+      test: ["CMD", "/busybox/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9325/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+  qd:
+    <<: *qd
+    command: ["server"]
+    # The server does not wait for the scheduler: only for the migrations.
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *qd-env
+      QD_PUBLIC_URL: http://localhost:9324
+      # Uncomment to require SigV4 signatures:
+      # QD_AUTH_MODE: sigv4
+      # QD_CREDENTIALS: AKIADEVEXAMPLE:dev-secret:000000000000
+    ports:
+      - "9324:9324" # SQS API
+      - "9325:9325" # admin: /healthz /readyz /metrics
+    healthcheck:
+      test: ["CMD", "/busybox/wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9325/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 10s
+    stop_grace_period: 30s
+    restart: unless-stopped
+
+volumes:
+  pgdata:

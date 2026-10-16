@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/qd-engine",
+    "crates/qd-sqs",
+    "crates/qd",
+    "crates/qd-e2e",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "LicenseRef-Proprietary"
+repository = "https://gitlab.hexploits.cloud/hexploits/services/simply-queued"
+
+[workspace.dependencies]
+qd-engine = { path = "crates/qd-engine" }
+qd-sqs = { path = "crates/qd-sqs" }
+qd = { path = "crates/qd" }
+
+anyhow = "1"
+async-trait = "0.1"
+axum = "0.8"
+base64 = "0.22"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dashmap = "6"
+form_urlencoded = "1"
+futures = "0.3"
+hex = "0.4"
+hmac = "0.12"
+http = "1"
+md-5 = "0.10"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+metrics-exporter-dogstatsd = "0.9"
+metrics-util = { version = "0.20", default-features = false, features = ["layer-filter"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+percent-encoding = "2"
+rand = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "postgres", "uuid", "chrono", "json", "migrate", "macros"] }
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+tower = "0.5"
+tower-http = { version = "0.6", features = ["trace", "catch-panic", "limit"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

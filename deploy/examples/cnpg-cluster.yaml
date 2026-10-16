@@ -1,0 +1,120 @@
+# Production Postgres for qd via CloudNativePG (https://cloudnative-pg.io).
+#
+# Prerequisite: the CNPG operator (>= 1.25 for `synchronous.dataDurability` below), e.g.
+#   kubectl apply --server-side -f \
+#     https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/release-1.25/releases/cnpg-1.25.1.yaml
+#
+#   kubectl create namespace qd
+#   kubectl apply -f deploy/examples/cnpg-cluster.yaml
+#   kubectl -n qd get cluster qd-pg -w
+#
+# CNPG then creates:
+#   Service  qd-pg-rw   -> current primary (use this; failover is transparent)
+#   Secret   qd-pg-app  -> keys username, password, host, port, dbname, uri, ...
+#
+# Point qd at it with the Helm chart:
+#   helm install qd deploy/helm/qd -n qd \
+#     --set database.existingSecret=qd-pg-app --set database.existingSecretKey=uri
+# (or let the chart create an equivalent cluster with --set postgresql.cnpg.enabled=true).
+#
+# Sizing: total connections = server replicas x QD_DB_MAX_CONNECTIONS (default 32)
+#   + scheduler replicas x scheduler pool (chart default 10) + 1 migrate pod.
+# 3 servers x 32 + 2 schedulers x 10 = 116, scaling to 10 servers = 340 -> max_connections 400
+# leaves headroom.
+---
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: qd-pg
+  namespace: qd
+spec:
+  # 1 primary + 2 hot standbys spread across nodes/zones.
+  instances: 3
+  imageName: ghcr.io/cloudnative-pg/postgresql:16
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+
+  bootstrap:
+    initdb:
+      database: qd
+      owner: qd
+
+  postgresql:
+    # Synchronous replication: a SendMessage is only acknowledged once at least one standby
+    # has the WAL, so an automatic failover never loses acknowledged messages (RPO=0).
+    # Costs one network round-trip of latency per commit. `dataDurability: preferred`
+    # (CNPG >= 1.25) degrades to async instead of blocking writes when no standby is
+    # available; `required` favours durability over availability. Remove this block for
+    # async replication (lower latency, may lose the last few ms of writes on failover).
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+    parameters:
+      # --- connections ------------------------------------------------------
+      max_connections: "400"
+      idle_in_transaction_session_timeout: "60s"
+      # --- memory (assumes 4Gi limit; scale with the instance) --------------
+      shared_buffers: "1GB"
+      effective_cache_size: "3GB"
+      work_mem: "8MB"
+      maintenance_work_mem: "256MB"
+      # --- WAL / checkpoints: queue workloads are write-heavy ----------------
+      wal_compression: "on"
+      wal_buffers: "16MB"
+      checkpoint_timeout: "15min"
+      checkpoint_completion_target: "0.9"
+      max_wal_size: "8GB"
+      min_wal_size: "1GB"
+      # --- autovacuum: messages are inserted, updated (receive/visibility) and
+      # deleted constantly; dead tuples must be reclaimed quickly to keep the
+      # receive path's index scans cheap. Vacuum early and let it work fast.
+      autovacuum_max_workers: "5"
+      autovacuum_naptime: "10s"
+      autovacuum_vacuum_scale_factor: "0.02"
+      autovacuum_vacuum_threshold: "500"
+      autovacuum_vacuum_insert_scale_factor: "0.05"
+      autovacuum_analyze_scale_factor: "0.02"
+      autovacuum_vacuum_cost_limit: "2000"
+      autovacuum_vacuum_cost_delay: "2ms"
+      # --- planner (SSD storage) --------------------------------------------
+      random_page_cost: "1.1"
+      effective_io_concurrency: "200"
+      # --- observability ----------------------------------------------------
+      log_min_duration_statement: "1000"
+      log_autovacuum_min_duration: "10s"
+      track_io_timing: "on"
+
+  storage:
+    size: 50Gi
+    # storageClass: fast-ssd
+  # Separate WAL volume keeps WAL fsyncs off the data volume's IO queue.
+  walStorage:
+    size: 20Gi
+    # storageClass: fast-ssd
+
+  resources:
+    requests:
+      cpu: "1"
+      memory: 4Gi
+    limits:
+      memory: 4Gi
+
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: topology.kubernetes.io/zone
+    podAntiAffinityType: preferred
+
+  monitoring:
+    enablePodMonitor: false # true if prometheus-operator is installed
+
+  # Continuous backup + PITR (strongly recommended). Uncomment and configure:
+  # backup:
+  #   retentionPolicy: 14d
+  #   barmanObjectStore:
+  #     destinationPath: s3://my-bucket/qd-pg
+  #     s3Credentials:
+  #       accessKeyId: { name: pg-backup-s3, key: ACCESS_KEY_ID }
+  #       secretAccessKey: { name: pg-backup-s3, key: SECRET_ACCESS_KEY }
+  #     wal:
+  #       compression: gzip

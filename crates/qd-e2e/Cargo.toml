@@ -1,0 +1,29 @@
+[package]
+name = "qd-e2e"
+description = "End-to-end tests driving qd through the official AWS SDK for Rust"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+qd.workspace = true
+qd-engine.workspace = true
+anyhow.workspace = true
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }
+aws-sdk-sqs = "1"
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+uuid.workspace = true
+libc = "0.2"
+reqwest.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+base64.workspace = true
+futures.workspace = true
+md-5.workspace = true
+hex.workspace = true
+serde_json.workspace = true

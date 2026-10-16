@@ -1,0 +1,28 @@
+[package]
+name = "qd-sqs"
+description = "AWS SQS wire-protocol frontend (JSON 1.0 and Query/XML) for qd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+qd-engine.workspace = true
+axum.workspace = true
+base64.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+form_urlencoded.workspace = true
+hex.workspace = true
+hmac.workspace = true
+http.workspace = true
+metrics.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tower.workspace = true

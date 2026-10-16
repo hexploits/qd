@@ -1,0 +1,19 @@
+{{- if .Values.podDisruptionBudget.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "qd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.labels" . | nindent 4 }}
+spec:
+  {{- if ne (toString .Values.podDisruptionBudget.minAvailable) "" }}
+  minAvailable: {{ .Values.podDisruptionBudget.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ .Values.podDisruptionBudget.maxUnavailable | default 1 }}
+  {{- end }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "qd.selectorLabels" . | nindent 6 }}
+{{- end }}

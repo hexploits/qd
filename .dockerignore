@@ -1,0 +1,28 @@
+# Build output / VCS
+target/
+**/target/
+.git/
+.gitignore
+.gitlab-ci.yml
+
+# Python e2e artefacts
+e2e/
+**/.venv*/
+**/venv/
+**/__pycache__/
+**/.pytest_cache/
+**/*.pyc
+
+# Deployment artefacts and docs are not needed to build the binary
+deploy/
+docs/
+docker-compose*.yml
+Dockerfile*
+.dockerignore
+
+# Editor / OS noise
+**/.idea/
+**/.vscode/
+**/.DS_Store
+**/*.log
+**/*.swp

@@ -1,0 +1,375 @@
+# GitLab CI for qd.
+#
+# Stages: lint -> test -> build -> publish
+#   lint:    rustfmt, clippy (-D warnings), helm lint/template, observability (promtool rule
+#            unit tests + Helm drift check)
+#   test:    cargo test --workspace (unit + Rust e2e against a postgres:16 service)
+#   build:   release binary (artifact) ...
+#   e2e:     ... exercised by the Python e2e suite and the observability metrics check
+#   resilience: chaos suite (rolling restart/upgrade/rollback, crashes, DB outage, Postgres
+#            failover) on every pipeline; 2h soak on schedules. The Kubernetes/CNPG test
+#            (e2e/k8s/run.sh) needs Docker for kind and is run manually.
+#   publish: container image -> $CI_REGISTRY_IMAGE (kaniko, no privileged runner needed)
+
+stages:
+  - lint
+  - test
+  - build
+  - e2e
+  - resilience
+  - publish
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+  RUST_IMAGE: docker.io/library/rust:1-bookworm
+  POSTGRES_IMAGE: docker.io/library/postgres:16
+  PROMETHEUS_VERSION: "3.15.0"   # promtool for the observability jobs
+  # postgres service settings (the e2e harness creates throw-away databases, so the
+  # user must be allowed to CREATE DATABASE -- POSTGRES_USER is a superuser).
+  POSTGRES_USER: qd
+  POSTGRES_PASSWORD: qd
+  POSTGRES_DB: qd_test
+  DATABASE_URL: postgres://qd:qd@postgres:5432/qd_test
+
+workflow:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS
+      when: never
+    - if: $CI_COMMIT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# Templates
+# ---------------------------------------------------------------------------
+.rust:
+  image: ${RUST_IMAGE}
+  interruptible: true
+  before_script:
+    - rustup show active-toolchain || rustup toolchain install
+    - rustc --version && cargo --version
+  cache:
+    # Registry/git sources are shared by every Rust job; keyed on the lockfile.
+    - key:
+        prefix: cargo-registry
+        files: [Cargo.lock]
+      paths:
+        - .cargo/registry/index/
+        - .cargo/registry/cache/
+        - .cargo/git/db/
+    # Build output is per job kind (debug vs release vs clippy) to avoid thrashing.
+    - key:
+        prefix: target-${CI_JOB_NAME_SLUG}
+        files: [Cargo.lock]
+      paths:
+        - target/
+
+.postgres:
+  services:
+    - name: ${POSTGRES_IMAGE}
+      alias: postgres
+      command: ["postgres", "-c", "max_connections=300", "-c", "fsync=off", "-c", "synchronous_commit=off"]
+
+# ---------------------------------------------------------------------------
+# lint
+# ---------------------------------------------------------------------------
+fmt:
+  extends: .rust
+  stage: lint
+  cache: []
+  script:
+    - cargo fmt --all -- --check
+
+clippy:
+  extends: .rust
+  stage: lint
+  script:
+    - cargo clippy --workspace --all-targets --locked -- -D warnings
+
+helm:
+  stage: lint
+  image:
+    name: docker.io/alpine/helm:3.16.4
+    entrypoint: [""]
+  interruptible: true
+  variables:
+    CHART: deploy/helm/qd
+    KUBECONFORM_VERSION: v0.6.7
+  before_script:
+    - apk add --no-cache curl tar
+    - curl -sSL "https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz" | tar -xz -C /usr/local/bin kubeconform
+  script:
+    - helm lint --strict "$CHART"
+    - helm lint --strict "$CHART" --set postgresql.cnpg.enabled=true
+    - mkdir -p rendered
+    - helm template qd "$CHART" > rendered/default.yaml
+    - helm template qd "$CHART" --set postgresql.cnpg.enabled=true --set networkPolicy.enabled=true --set networkPolicy.egress.enabled=true > rendered/cnpg.yaml
+    - helm template qd "$CHART" --set database.existingSecret=db --set auth.mode=sigv4 --set auth.existingSecret=creds > rendered/existing-secrets.yaml
+    - helm template qd "$CHART" --set autoscaling.enabled=true --set metrics.serviceMonitor.enabled=true --set ingress.enabled=true --set service.ports.sqs=80 > rendered/everything.yaml
+    - helm template qd "$CHART" --set postgresql.cnpg.enabled=true --set metrics.serviceMonitor.enabled=true --set metrics.podAnnotations=true --set prometheusRule.enabled=true --set grafanaDashboard.enabled=true --set metrics.pushgateway.url=http://pushgateway.monitoring:9091 --set metrics.dogstatsd.enabled=true --set metrics.datadogAutodiscovery.enabled=true > rendered/observability.yaml
+    - kubeconform -strict -summary -ignore-missing-schemas -kubernetes-version 1.30.0 rendered/*.yaml deploy/examples/kind-quickstart.yaml deploy/examples/cnpg-cluster.yaml
+  rules:
+    - changes: [deploy/**/*]
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# Prometheus rules (promtool check + unit tests for every alert), the Helm chart's copies of
+# the rules/dashboard (drift check + rendered PrometheusRule passes the same tests), dashboard JSON.
+observability:
+  stage: lint
+  image:
+    name: docker.io/alpine/helm:3.16.4
+    entrypoint: [""]
+  interruptible: true
+  before_script:
+    - apk add --no-cache bash curl tar python3
+    - curl -sSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" | tar -xz -C /tmp
+    - install -m 0755 "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+  script:
+    - bash deploy/observability/check.sh
+  rules:
+    - changes: [deploy/**/*]
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+test:
+  extends: [.rust, .postgres]
+  stage: test
+  script:
+    - cargo test --workspace --locked --no-fail-fast
+
+# ---------------------------------------------------------------------------
+# build: release binary, reused by the Python e2e job
+# ---------------------------------------------------------------------------
+build-binary:
+  extends: .rust
+  stage: build
+  needs: []
+  script:
+    - cargo build --release --locked -p qd
+    - mkdir -p dist && cp target/release/qd dist/
+    - dist/qd --version
+  artifacts:
+    paths: [dist/qd]
+    expire_in: 1 week
+
+# ---------------------------------------------------------------------------
+# e2e: Python (boto3) suite against the real binary
+# ---------------------------------------------------------------------------
+e2e-python:
+  extends: .postgres
+  stage: e2e
+  image: docker.io/library/python:3.12-bookworm
+  interruptible: true
+  needs: [build-binary]
+  variables:
+    QD_E2E_BINARY: ${CI_PROJECT_DIR}/dist/qd
+    # The AWS CLI smoke script needs CLI v2, which this image doesn't ship.
+    QD_E2E_CLI: "0"
+    PIP_CACHE_DIR: ${CI_PROJECT_DIR}/.cache/pip
+  cache:
+    key: pip-${CI_JOB_NAME_SLUG}
+    paths: [.cache/pip]
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client >/dev/null
+    - chmod +x "$QD_E2E_BINARY"
+    - until pg_isready -d "$DATABASE_URL"; do sleep 1; done
+  script:
+    # run.sh starts the server from $QD_E2E_BINARY against $DATABASE_URL and runs the suite.
+    - bash e2e/python/run.sh
+  artifacts:
+    when: always
+    paths:
+      - e2e/python/.out/
+    reports:
+      junit: e2e/python/.out/junit-*.xml
+    expire_in: 1 week
+
+# ---------------------------------------------------------------------------
+# e2e: every metric referenced by the alert rules / Grafana dashboard is really exported
+# ---------------------------------------------------------------------------
+e2e-observability:
+  extends: .postgres
+  stage: e2e
+  image: docker.io/library/python:3.12-bookworm
+  interruptible: true
+  needs: [build-binary]
+  variables:
+    QD_E2E_BINARY: ${CI_PROJECT_DIR}/dist/qd
+    # check-metrics.sh creates (and drops) its own throw-away database next to this one.
+    DATABASE_URL: postgres://qd:qd@postgres:5432/postgres
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql-client unzip >/dev/null
+    - curl -sSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
+    - unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install >/dev/null && aws --version
+    - curl -sSL "https://github.com/prometheus/prometheus/releases/download/v${PROMETHEUS_VERSION}/prometheus-${PROMETHEUS_VERSION}.linux-amd64.tar.gz" | tar -xz -C /tmp
+    - install -m 0755 "/tmp/prometheus-${PROMETHEUS_VERSION}.linux-amd64/promtool" /usr/local/bin/promtool
+    - chmod +x "$QD_E2E_BINARY"
+    - until pg_isready -d "$DATABASE_URL"; do sleep 1; done
+  script:
+    - QD_OBS_SCRAPE_OUT=metrics.txt bash e2e/observability/check-metrics.sh
+  artifacts:
+    when: always
+    paths: [metrics.txt]
+    expire_in: 1 week
+
+# ---------------------------------------------------------------------------
+# resilience: real processes + real Postgres primary/standby under continuous load
+# ---------------------------------------------------------------------------
+.chaos:
+  extends: [.rust, .postgres]
+  stage: resilience
+  needs: []
+  variables:
+    GIT_DEPTH: "0"            # tags are needed to build the previous release for upgrade tests
+    QD_PG_BIN: /usr/lib/postgresql/15/bin
+  before_script:
+    - apt-get update -qq && apt-get install -y -qq --no-install-recommends postgresql postgresql-client >/dev/null
+    - rustup show active-toolchain || rustup toolchain install
+    - until pg_isready -d "$DATABASE_URL"; do sleep 1; done
+
+chaos:
+  extends: .chaos
+  script:
+    # Rolling restart, rolling upgrade from the latest tag + rollback, replica SIGKILLs,
+    # database outage, primary->sync-standby failover, migration race, rollback-schema tolerance.
+    - bash e2e/chaos/run.sh
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+      when: never
+    - when: on_success
+
+soak:
+  extends: .chaos
+  timeout: 3h
+  variables:
+    QD_SOAK_SECONDS: "7200"
+  script:
+    - bash e2e/chaos/run.sh soak
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "schedule"
+    - if: $CI_PIPELINE_SOURCE == "web"
+      when: manual
+      allow_failure: true
+
+# ---------------------------------------------------------------------------
+# publish: container image (kaniko; works on unprivileged runners)
+# ---------------------------------------------------------------------------
+container-image:
+  stage: publish
+  image:
+    name: gcr.io/kaniko-project/executor:v1.23.2-debug
+    entrypoint: [""]
+  # Only publish images that passed every functional, protocol, observability and resilience gate.
+  needs:
+    - job: test
+      artifacts: false
+    - job: clippy
+      artifacts: false
+    - job: e2e-python
+      artifacts: false
+    - job: e2e-observability
+      artifacts: false
+    - job: chaos
+      artifacts: false
+  script:
+    - mkdir -p /kaniko/.docker
+    - |
+      printf '{"auths":{"%s":{"auth":"%s"}}}' "$CI_REGISTRY" \
+        "$(printf '%s:%s' "$CI_REGISTRY_USER" "$CI_REGISTRY_PASSWORD" | base64 | tr -d '\n')" \
+        > /kaniko/.docker/config.json
+    - |
+      DESTS="--destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_SHORT_SHA}"
+      if [ "$CI_COMMIT_BRANCH" = "$CI_DEFAULT_BRANCH" ]; then
+        DESTS="$DESTS --destination ${CI_REGISTRY_IMAGE}:latest"
+      fi
+      if [ -n "$CI_COMMIT_TAG" ]; then
+        DESTS="$DESTS --destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG} --destination ${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG#v}"
+      fi
+      # MRs build the image (to catch Dockerfile breakage) but do not push it.
+      if [ "$CI_PIPELINE_SOURCE" = "merge_request_event" ]; then
+        DESTS="--no-push --no-push-cache"
+      fi
+      /kaniko/executor \
+        --context "${CI_PROJECT_DIR}" \
+        --dockerfile "${CI_PROJECT_DIR}/Dockerfile" \
+        --target runtime \
+        --build-arg "REVISION=${CI_COMMIT_SHA}" \
+        --build-arg "VERSION=${CI_COMMIT_TAG:-${CI_COMMIT_SHORT_SHA}}" \
+        --build-arg "CREATED=${CI_PIPELINE_CREATED_AT}" \
+        --label "org.opencontainers.image.revision=${CI_COMMIT_SHA}" \
+        --cache=true \
+        --cache-repo "${CI_REGISTRY_IMAGE}/cache" \
+        --snapshot-mode=redo \
+        --use-new-run \
+        $DESTS
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_COMMIT_TAG
+
+# ---------------------------------------------------------------------------
+# packages (tags only): Helm chart -> GitLab Helm registry, binary -> Generic registry,
+# and a GitLab Release linking everything. Tag releases as vX.Y.Z.
+# ---------------------------------------------------------------------------
+helm-chart:
+  stage: publish
+  image: docker.io/alpine/helm:3.16.4
+  needs:
+    - job: container-image
+      artifacts: false
+  script:
+    - VERSION="${CI_COMMIT_TAG#v}"
+    - CHART=deploy/helm/qd
+    # The published chart points at this project's registry and the image built for this tag.
+    - |
+      sed -i "s#^  repository: .*#  repository: ${CI_REGISTRY_IMAGE}#" "$CHART/values.yaml"
+    - helm package "$CHART" --version "$VERSION" --app-version "$VERSION" -d dist
+    - apk add --no-cache curl >/dev/null
+    - >
+      curl --fail-with-body --request POST
+      --user "gitlab-ci-token:${CI_JOB_TOKEN}"
+      --form "chart=@dist/qd-${VERSION}.tgz"
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/api/stable/charts"
+  artifacts:
+    paths: [dist/*.tgz]
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/
+
+binary-package:
+  stage: publish
+  image: docker.io/curlimages/curl:8.11.1
+  needs: [build-binary]
+  script:
+    - >
+      curl --fail-with-body --header "JOB-TOKEN: ${CI_JOB_TOKEN}"
+      --upload-file dist/qd
+      "${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/qd/${CI_COMMIT_TAG}/qd-linux-amd64"
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/
+
+release:
+  stage: publish
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  needs: [helm-chart, binary-package]
+  script:
+    - echo "Releasing ${CI_COMMIT_TAG}"
+  release:
+    tag_name: $CI_COMMIT_TAG
+    name: qd $CI_COMMIT_TAG
+    description: |
+      Container image: `${CI_REGISTRY_IMAGE}:${CI_COMMIT_TAG}` (also `:latest` on the default branch)
+
+      Helm: `helm repo add qd ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/helm/stable`
+    assets:
+      links:
+        - name: qd-linux-amd64
+          url: ${CI_API_V4_URL}/projects/${CI_PROJECT_ID}/packages/generic/qd/${CI_COMMIT_TAG}/qd-linux-amd64
+  rules:
+    - if: $CI_COMMIT_TAG =~ /^v\d+\.\d+\.\d+/

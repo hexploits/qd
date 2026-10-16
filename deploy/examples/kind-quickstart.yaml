@@ -1,0 +1,430 @@
+# qd quickstart for kind / minikube / any dev cluster.
+#
+#   ##########################################################################
+#   #  DEV ONLY: the Postgres below is a single instance with no backups,    #
+#   #  no replication and a password checked into this file. For production  #
+#   #  use CloudNativePG (see cnpg-cluster.yaml) or a managed Postgres, and  #
+#   #  the Helm chart in deploy/helm/qd.                          #
+#   ##########################################################################
+#
+# Usage:
+#   kind create cluster
+#   docker build -t qd:dev .            # from the repo root
+#   kind load docker-image qd:dev
+#   kubectl apply -f deploy/examples/kind-quickstart.yaml
+#   kubectl -n qd wait --for=condition=complete job/qd-migrate --timeout=300s
+#   kubectl -n qd rollout status deploy/qd-scheduler
+#   kubectl -n qd rollout status deploy/qd
+#   kubectl -n qd port-forward svc/qd 9324:9324 9325:9325
+#   curl localhost:9325/readyz
+#   AWS_ACCESS_KEY_ID=x AWS_SECRET_ACCESS_KEY=y AWS_DEFAULT_REGION=us-east-1 \
+#     aws --endpoint-url http://localhost:9324 sqs create-queue --queue-name hello
+#
+# In-cluster clients use endpoint_url=http://qd.qd.svc:9324
+#
+# Three roles, one image (like the Helm chart):
+#   Job        qd-migrate    `qd migrate` (waits for Postgres, migrates, exits)
+#   Deployment qd-scheduler  `qd scheduler` (retention, redrive, queue gauges)
+#   Deployment qd            `qd server` (SQS API) + Service qd
+# Migrations first; scheduler and server then start in parallel (each waits for the schema in a
+# `wait-for-schema` init container). The scheduler pods use a different app.kubernetes.io/name
+# so the SQS Service never selects them.
+# Jobs are immutable: to re-run the migration after changing the image, delete the Job first
+# (`kubectl -n qd delete job qd-migrate`) and re-apply.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: qd
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: qd-db
+  namespace: qd
+type: Opaque
+stringData:
+  POSTGRES_USER: qd
+  POSTGRES_PASSWORD: qd-dev-password # DEV ONLY
+  POSTGRES_DB: qd
+  database-url: postgres://qd:qd-dev-password@postgres.qd.svc:5432/qd
+---
+# ---------------------------------------------------------------------------
+# Postgres (DEV ONLY - single instance)
+# ---------------------------------------------------------------------------
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  clusterIP: None
+  selector:
+    app.kubernetes.io/name: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgres
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  serviceName: postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+    spec:
+      securityContext:
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          image: postgres:16
+          args: ["-c", "max_connections=200", "-c", "autovacuum_naptime=10s"]
+          envFrom:
+            - secretRef:
+                name: qd-db
+          env:
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            periodSeconds: 5
+          livenessProbe:
+            exec:
+              command: ["sh", "-c", "pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 2Gi
+---
+# ---------------------------------------------------------------------------
+# qd 1/3: migrations (Job)
+# ---------------------------------------------------------------------------
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: qd-migrate
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: qd-migrate
+    app.kubernetes.io/component: migrate
+spec:
+  backoffLimit: 10
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qd-migrate
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never # failed attempts keep their pod + logs
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: qd:dev
+          imagePullPolicy: IfNotPresent
+          args: ["migrate"] # waits up to QD_MIGRATE_TIMEOUT_SECS (600) for Postgres
+          env:
+            - name: QD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qd-db
+                  key: database-url
+            - name: QD_LOG_FORMAT
+              value: text
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+# ---------------------------------------------------------------------------
+# qd 2/3: scheduler (background workers; several replicas are safe)
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qd-scheduler
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: qd-scheduler
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qd-scheduler
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qd-scheduler
+        app.kubernetes.io/component: scheduler
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-schema
+          image: qd:dev
+          imagePullPolicy: IfNotPresent
+          args: ["wait-for-schema"]
+          env:
+            - name: QD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qd-db
+                  key: database-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      containers:
+        - name: scheduler
+          image: qd:dev
+          imagePullPolicy: IfNotPresent
+          args: ["scheduler"]
+          env:
+            - name: QD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qd-db
+                  key: database-url
+            - name: QD_LOG_FORMAT
+              value: text
+            - name: QD_DB_MAX_CONNECTIONS
+              value: "8"
+          ports:
+            - name: admin
+              containerPort: 9325
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 90
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+# ---------------------------------------------------------------------------
+# qd 3/3: server (SQS API)
+# ---------------------------------------------------------------------------
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: qd
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: qd
+    app.kubernetes.io/component: server
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qd
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: qd
+        app.kubernetes.io/component: server
+    spec:
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      terminationGracePeriodSeconds: 40
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 65532
+        runAsGroup: 65532
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        - name: wait-for-schema
+          image: qd:dev
+          imagePullPolicy: IfNotPresent
+          args: ["wait-for-schema"]
+          env:
+            - name: QD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qd-db
+                  key: database-url
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              memory: 128Mi
+      containers:
+        - name: qd
+          image: qd:dev # built locally and `kind load`ed
+          imagePullPolicy: IfNotPresent
+          args: ["server"]
+          env:
+            - name: QD_DATABASE_URL
+              valueFrom:
+                secretKeyRef:
+                  name: qd-db
+                  key: database-url
+            - name: QD_LOG_FORMAT
+              value: text
+            - name: QD_DB_MAX_CONNECTIONS
+              value: "16"
+          ports:
+            - name: sqs
+              containerPort: 9324
+            - name: admin
+              containerPort: 9325
+          startupProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 2
+            failureThreshold: 90
+          livenessProbe:
+            httpGet: { path: /healthz, port: admin }
+            periodSeconds: 10
+          readinessProbe:
+            httpGet: { path: /readyz, port: admin }
+            periodSeconds: 5
+            failureThreshold: 2
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: 5 # needs Kubernetes >= 1.30 (kind's default node image is fine)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: qd
+  namespace: qd
+  labels:
+    app.kubernetes.io/name: qd
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: qd
+  ports:
+    - name: sqs
+      port: 9324
+      targetPort: sqs
+    - name: admin
+      port: 9325
+      targetPort: admin
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: qd
+  namespace: qd
+spec:
+  maxUnavailable: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: qd

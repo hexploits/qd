@@ -1,0 +1,19 @@
+apiVersion: v2
+name: qd
+description: Highly-available, Postgres-backed, AWS SQS-compatible message queue
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+kubeVersion: ">=1.29.0-0"
+keywords:
+  - sqs
+  - queue
+  - postgres
+  - messaging
+home: https://gitlab.hexploits.cloud/hexploits/services/simply-queued
+sources:
+  - https://gitlab.hexploits.cloud/hexploits/services/simply-queued
+maintainers:
+  - name: Hexploits
+annotations:
+  category: Messaging

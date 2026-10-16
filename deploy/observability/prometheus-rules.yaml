@@ -1,0 +1,311 @@
+# Prometheus recording + alerting rules for qd.
+#
+# SINGLE SOURCE OF TRUTH. The Helm chart ships a byte-identical copy at
+# deploy/helm/qd/files/prometheus-rules.yaml (rendered as a PrometheusRule when
+# prometheusRule.enabled=true). After editing this file run:
+#
+#   deploy/observability/sync-chart-files.sh          # copy into the chart
+#   deploy/observability/check.sh                     # promtool check/test + drift check
+#
+# The chart substitutes thresholds, the `up` job matcher and the runbook base URL by exact
+# string replacement of the literal defaults below (see templates/prometheusrule.yaml); the
+# template fails loudly if a literal it expects is missing, so keep them in sync.
+#
+# Conventions:
+#   * Aggregations keep `namespace` and `job` so several installations scraped by one
+#     Prometheus stay separate (labels that don't exist are simply empty).
+#   * Roles: `server` pods (SQS API) export request/message counters, the notifier/long-poll
+#     gauges and qd_scheduler_heartbeat_age_seconds; `scheduler` pods export the queue gauges
+#     (qd_queue_*, qd_queues, qd_move_tasks_running), janitor/expiry/redrive metrics and
+#     qd_scheduler_heartbeats_total; both export qd_ready, qd_db_* and qd_build_info{role}.
+#     An all-in-one process (role="all") exports everything. With the Helm chart's
+#     ServiceMonitor the two roles are two jobs: "<fullname>" and "<fullname>-scheduler".
+#   * Queue gauges (qd_queue_*) are reported identically by EVERY scheduler replica: always
+#     aggregate with `max by (...)`, never sum.
+#   * ReceiveMessage latency includes long polls (up to 20s) and is excluded from latency alerts.
+groups:
+  - name: qd.recording
+    rules:
+      # --- API traffic -------------------------------------------------------------------
+      - record: qd:requests:rate5m
+        expr: sum by (namespace, job, action) (rate(qd_requests_total[5m]))
+      - record: qd:requests_server_errors:rate5m
+        expr: sum by (namespace, job, action) (rate(qd_requests_total{code=~"InternalFailure|ServiceUnavailable"}[5m]))
+      # Overall server-error (5xx) ratio per installation; 0 (not absent) when there are no errors.
+      - record: qd:requests_server_errors:ratio_rate5m
+        expr: |
+          (
+              sum by (namespace, job) (qd:requests_server_errors:rate5m)
+            or
+              sum by (namespace, job) (qd:requests:rate5m) * 0
+          )
+          /
+          sum by (namespace, job) (qd:requests:rate5m)
+      - record: qd:request_duration_seconds:p99_5m
+        expr: histogram_quantile(0.99, sum by (namespace, job, action, le) (rate(qd_request_duration_seconds_bucket[5m])))
+      - record: qd:request_duration_seconds:p50_5m
+        expr: histogram_quantile(0.50, sum by (namespace, job, action, le) (rate(qd_request_duration_seconds_bucket[5m])))
+      # --- Queues (gauges are identical on every scheduler replica -> max) -----------------
+      - record: qd:queue_messages:max
+        expr: max by (namespace, job, account, queue, state) (qd_queue_messages)
+      - record: qd:queue_oldest_message_age_seconds:max
+        expr: max by (namespace, job, account, queue) (qd_queue_oldest_message_age_seconds)
+      - record: qd:queue_info:max
+        expr: max by (namespace, job, account, queue, type, is_dlq) (qd_queue_info)
+      - record: qd:messages_sent:rate5m
+        expr: sum by (namespace, job, queue) (rate(qd_messages_sent_total[5m]))
+      - record: qd:messages_received:rate5m
+        expr: sum by (namespace, job, queue) (rate(qd_messages_received_total[5m]))
+      - record: qd:messages_deleted:rate5m
+        expr: sum by (namespace, job, queue) (rate(qd_messages_deleted_total[5m]))
+      - record: qd:messages_dead_lettered:rate5m
+        expr: sum by (namespace, job, queue) (rate(qd_messages_dead_lettered_total[5m]))
+      # --- Runtime (per replica) -----------------------------------------------------------
+      - record: qd:db_pool_utilization:ratio
+        expr: qd_db_pool_connections{state="in_use"} / ignoring (state) qd_db_pool_max_connections
+
+  - name: qd.availability
+    rules:
+      - alert: QdReplicaDown
+        expr: up{job=~".*qd.*"} == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd replica {{ $labels.instance }} cannot be scraped
+          description: >-
+            Prometheus has failed to scrape {{ $labels.instance }} (job {{ $labels.job }},
+            namespace {{ $labels.namespace }}) for 5 minutes. The pod is down, crash-looping
+            or its admin port is unreachable.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdreplicadown
+
+      - alert: QdNotReady
+        expr: qd_ready == 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd replica {{ $labels.instance }} is not ready
+          description: >-
+            {{ $labels.instance }} has reported qd_ready=0 for 2 minutes: it cannot reach the
+            database (or is stuck draining) and is out of the Service endpoints.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdnotready
+
+      - alert: QdAllReplicasNotReady
+        expr: |
+          (max by (namespace, job) (qd_ready) == 0)
+          or
+          (max by (namespace, job) (up{job=~".*qd.*"}) == 0)
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: qd {{ $labels.namespace }}/{{ $labels.job }} has no ready replica
+          description: >-
+            No replica of {{ $labels.job }} in {{ $labels.namespace }} has been ready (or
+            scrapeable) for 2 minutes. For the server job the SQS API is unavailable to clients;
+            for the scheduler job background maintenance has stopped (see
+            QdSchedulerDown). This is almost always the database: check Postgres /
+            CloudNativePG health first.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdallreplicasnotready
+
+      - alert: QdServerErrorsHigh
+        expr: qd:requests_server_errors:ratio_rate5m > 0.01
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd 5xx error ratio is {{ $value | humanizePercentage }}
+          description: >-
+            An elevated share ({{ $value | humanizePercentage }}) of SQS API requests to {{ $labels.job }} ({{ $labels.namespace }})
+            failed with InternalFailure/ServiceUnavailable over the last 5 minutes.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdservererrorshigh
+
+      - alert: QdServerErrorsCritical
+        expr: qd:requests_server_errors:ratio_rate5m > 0.05
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: qd 5xx error ratio is {{ $value | humanizePercentage }}
+          description: >-
+            A large share ({{ $value | humanizePercentage }}) of SQS API requests to {{ $labels.job }} ({{ $labels.namespace }})
+            failed with InternalFailure/ServiceUnavailable over the last 5 minutes.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdservererrorscritical
+
+      - alert: QdHighLatency
+        expr: qd:request_duration_seconds:p99_5m{action!="ReceiveMessage"} > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd p99 latency for {{ $labels.action }} is {{ $value | humanizeDuration }}
+          description: >-
+            The 99th percentile latency of {{ $labels.action }} on {{ $labels.job }}
+            ({{ $labels.namespace }}) has been above the alert threshold for 10 minutes (ReceiveMessage is
+            excluded because it includes long polls).
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdhighlatency
+
+      # Per role: server and scheduler roll out independently (and may be one job when scraped
+      # via pod annotations), so only replicas of the same role are compared.
+      - alert: QdVersionSkew
+        expr: count by (namespace, job, role) (count by (namespace, job, role, version) (qd_build_info)) > 1
+        for: 1h
+        labels:
+          severity: info
+        annotations:
+          summary: qd replicas of {{ $labels.job }} run {{ $value }} different versions
+          description: >-
+            Replicas of {{ $labels.job }} (role {{ $labels.role }}) in {{ $labels.namespace }} have
+            reported more than one qd_build_info version for over an hour. A rollout is probably stuck.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdversionskew
+
+      # Evaluated from the SERVER side: every server reports the age of the freshest scheduler
+      # heartbeat row in the database, so this fires whether the scheduler pods are gone, crash
+      # looping, unschedulable or simply not scraped. The second branch covers "no heartbeat at
+      # all" (the gauge is absent while API servers are running), e.g. a scheduler that never
+      # started. absent() is deliberately not used: it would lose namespace/job and fire in
+      # every Prometheus that scrapes no qd at all.
+      - alert: QdSchedulerDown
+        expr: |
+          max by (namespace, job) (qd_scheduler_heartbeat_age_seconds) > 120
+          or
+          (
+            max by (namespace, job) (qd_build_info{role="server"})
+            unless on (namespace, job)
+            max by (namespace, job) (qd_scheduler_heartbeat_age_seconds)
+          )
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: qd {{ $labels.namespace }}/{{ $labels.job }} has no running scheduler
+          description: >-
+            The API servers of {{ $labels.job }} in {{ $labels.namespace }} have seen no fresh
+            scheduler heartbeat for 5 minutes (the newest is older than the alert threshold, or
+            there is none). The SQS API keeps serving, but retention cleanup of expired messages,
+            deleted-queue reclaim, DLQ redrive / message-move tasks and the per-queue gauges
+            (and every queue alert built on them) have stopped.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdschedulerdown
+
+  - name: qd.runtime
+    rules:
+      - alert: QdDatabaseErrors
+        expr: rate(qd_db_errors_total[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd replica {{ $labels.instance }} is seeing database errors ({{ $labels.kind }})
+          description: >-
+            {{ $labels.instance }} has been recording "{{ $labels.kind }}" database errors for
+            5 minutes ({{ $value | humanize }}/s).
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddatabaseerrors
+
+      - alert: QdNotifierDisconnected
+        expr: qd_notifier_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd replica {{ $labels.instance }} lost its LISTEN connection
+          description: >-
+            The cross-replica notification (LISTEN/NOTIFY) connection of {{ $labels.instance }}
+            has been down for 5 minutes. Long polls on this replica only notice messages sent
+            via other replicas on their periodic re-check, so receive latency increases.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdnotifierdisconnected
+
+      - alert: QdDBPoolSaturated
+        expr: qd:db_pool_utilization:ratio > 0.9
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd replica {{ $labels.instance }} DB pool is {{ $value | humanizePercentage }} in use
+          description: >-
+            The database pool of {{ $labels.instance }} has been nearly exhausted
+            ({{ $value | humanizePercentage }} in use) for 10 minutes. Requests will start
+            waiting for connections (and time out after QD_DB_ACQUIRE_TIMEOUT_SECS).
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddbpoolsaturated
+
+      - alert: QdJanitorFailing
+        expr: increase(qd_janitor_runs_total{result="error"}[15m]) > 2
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd janitor is failing on {{ $labels.instance }}
+          description: >-
+            {{ $value | humanize }} background maintenance passes failed on {{ $labels.instance }}
+            in the last 15 minutes. Expired messages, receipts and deduplication entries are
+            not being cleaned up.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdjanitorfailing
+
+      - alert: QdQueueMetricsCollectionSlow
+        expr: histogram_quantile(0.99, sum by (namespace, job, instance, le) (rate(qd_queue_metrics_collection_seconds_bucket[15m]))) > 20
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: qd queue metrics collection is slow on {{ $labels.instance }}
+          description: >-
+            Collecting per-queue gauges takes {{ $value | humanizeDuration }} (p99) on
+            {{ $labels.instance }}. Queue depth/age gauges are stale and the collection query
+            is loading the database. Raise QD_QUEUE_METRICS_INTERVAL_SECS or investigate table bloat.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdqueuemetricscollectionslow
+
+  - name: qd.queues
+    rules:
+      - alert: QdDeadLetterQueueNotEmpty
+        expr: |
+          qd:queue_messages:max{state="visible"}
+            * on (namespace, job, account, queue)
+          qd:queue_info:max{is_dlq="true"}
+          > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: dead-letter queue {{ $labels.queue }} has {{ $value }} messages
+          description: >-
+            Dead-letter queue {{ $labels.queue }} (account {{ $labels.account }}) has held
+            visible messages for 5 minutes: consumers of its source queue(s) are failing to
+            process messages.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddeadletterqueuenotempty
+
+      - alert: QdOldestMessageTooOld
+        expr: |
+          qd:queue_oldest_message_age_seconds:max > 3600
+          unless on (namespace, job, account, queue)
+          qd:queue_info:max{is_dlq="true"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: oldest message in {{ $labels.queue }} is {{ $value | humanizeDuration }} old
+          description: >-
+            The oldest message in queue {{ $labels.queue }} (account {{ $labels.account }}) is
+            {{ $value | humanizeDuration }} old (above the alert threshold) and has been for
+            15 minutes. Consumers are stalled or too slow.
+            Dead-letter queues are excluded (see QdDeadLetterQueueNotEmpty).
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdoldestmessagetooold
+
+      - alert: QdBacklogGrowing
+        expr: |
+          (
+              qd:queue_messages:max{state="visible"} > 1000
+            and
+              deriv(qd:queue_messages:max{state="visible"}[30m]) > 0
+          )
+          unless on (namespace, job, account, queue)
+          qd:queue_info:max{is_dlq="true"}
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: backlog of {{ $labels.queue }} keeps growing
+          description: >-
+            Queue {{ $labels.queue }} (account {{ $labels.account }}) has {{ $value }} visible messages
+            (above the alert threshold) and its depth has trended upwards for the last 30+ minutes: producers are
+            outpacing consumers.
+          runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdbackloggrowing

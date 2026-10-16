@@ -1,0 +1,65 @@
+{{- if .Values.postgresql.cnpg.enabled }}
+{{- $pg := .Values.postgresql.cnpg }}
+{{- $name := include "qd.cnpgName" . }}
+{{- with $pg.synchronous }}
+{{- if and .number (ge (int .number) (int $pg.instances)) }}
+{{- fail (printf "postgresql.cnpg.synchronous.number (%v) must be lower than postgresql.cnpg.instances (%v); set synchronous=null to disable synchronous replication" .number $pg.instances) }}
+{{- end }}
+{{- end }}
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: {{ $name }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.labels" . | nindent 4 }}
+    app.kubernetes.io/component: database
+  annotations:
+    # Keep the database (and its PVCs) if the Helm release is uninstalled.
+    helm.sh/resource-policy: keep
+spec:
+  instances: {{ $pg.instances }}
+  {{- with $pg.imageName }}
+  imageName: {{ . }}
+  {{- end }}
+  primaryUpdateStrategy: unsupervised
+  primaryUpdateMethod: switchover
+  bootstrap:
+    initdb:
+      database: {{ $pg.database }}
+      owner: {{ $pg.owner }}
+  postgresql:
+    parameters:
+      {{- range $k, $v := $pg.parameters }}
+      {{ $k }}: {{ $v | toString | quote }}
+      {{- end }}
+    {{- with $pg.synchronous }}
+    synchronous:
+      {{- toYaml . | nindent 6 }}
+    {{- end }}
+  storage:
+    size: {{ $pg.storage.size }}
+    {{- with $pg.storage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  {{- if $pg.walStorage.enabled }}
+  walStorage:
+    size: {{ $pg.walStorage.size }}
+    {{- with $pg.walStorage.storageClass }}
+    storageClass: {{ . }}
+    {{- end }}
+  {{- end }}
+  affinity:
+    enablePodAntiAffinity: true
+    topologyKey: kubernetes.io/hostname
+    podAntiAffinityType: preferred
+  {{- with $pg.resources }}
+  resources:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  monitoring:
+    enablePodMonitor: {{ $pg.enablePodMonitor }}
+  {{- with $pg.extraSpec }}
+  {{- toYaml . | nindent 2 }}
+  {{- end }}
+{{- end }}

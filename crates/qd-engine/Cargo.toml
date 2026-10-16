@@ -1,0 +1,27 @@
+[package]
+name = "qd-engine"
+description = "Protocol-agnostic, Postgres-backed queue engine with SQS semantics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+hex.workspace = true
+md-5.workspace = true
+metrics.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }

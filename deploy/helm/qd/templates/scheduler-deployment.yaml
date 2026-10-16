@@ -1,0 +1,182 @@
+{{- /*
+Scheduler role: background workers only (retention janitor, deleted-queue reclaim, DLQ redrive /
+message-move tasks, per-queue metric gauges, scheduler heartbeat). Admin endpoints only (no SQS
+port). Several replicas may run concurrently: the work is idempotent (SKIP LOCKED), no leader
+election. Pods start once the schema is current (wait-for-schema init container).
+*/}}
+{{- $s := .Values.scheduler }}
+{{- $sel := dict "root" . "role" "scheduler" }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "qd.roleFullname" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.roleLabels" $sel | nindent 4 }}
+spec:
+  replicas: {{ $s.replicaCount }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml $s.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "qd.roleSelectorLabels" $sel | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "qd.roleLabels" $sel | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+        {{- with $s.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "qd.podAnnotations" . | nindent 8 }}
+        {{- with $s.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+    spec:
+      serviceAccountName: {{ include "qd.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($s.priorityClassName | default .Values.priorityClassName) }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ $s.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        {{- include "qd.utilityContainer" (dict "root" . "name" "wait-for-schema" "args" (list "wait-for-schema") "resources" .Values.initContainerResources) | nindent 8 }}
+      containers:
+        - name: scheduler
+          image: {{ include "qd.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["scheduler"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: admin
+              containerPort: {{ .Values.containerPorts.admin }}
+              protocol: TCP
+          envFrom:
+            {{- include "qd.envFrom" . | nindent 12 }}
+          env:
+            {{- include "qd.databaseEnv" . | nindent 12 }}
+            - name: QD_RUN_MIGRATIONS
+              value: "false"
+            # No SQS API in this role, so it never needs the SigV4 credentials.
+            - name: QD_AUTH_MODE
+              value: "none"
+            {{- with $s.dbMaxConnections }}
+            - name: QD_DB_MAX_CONNECTIONS
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with (include "qd.dogstatsdEnv" .) }}{{- . | nindent 12 }}{{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            {{- with $s.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if $s.startupProbe.enabled }}
+          startupProbe:
+            {{- toYaml (omit $s.startupProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if $s.livenessProbe.enabled }}
+          livenessProbe:
+            {{- toYaml (omit $s.livenessProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if $s.readinessProbe.enabled }}
+          readinessProbe:
+            {{- toYaml (omit $s.readinessProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if gt (int $s.lifecycle.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int $s.lifecycle.preStopSleepSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml $s.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "qd.commonVolumeMounts" . | nindent 12 }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if $s.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- tpl (toYaml $s.topologySpreadConstraints) . | nindent 8 }}
+      {{- else if $s.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range $k := list "zone" "node" }}
+        {{- $c := index $s.topologySpread $k }}
+        - maxSkew: {{ $c.maxSkew }}
+          topologyKey: {{ $c.topologyKey }}
+          whenUnsatisfiable: {{ $c.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "qd.roleSelectorLabels" $sel | nindent 14 }}
+          matchLabelKeys:
+            - pod-template-hash
+        {{- end }}
+      {{- end }}
+      {{- with $s.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $s.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+---
+# Metrics/health Service for the scheduler pods (admin port only; scraped by the ServiceMonitor).
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "qd.roleFullname" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.roleLabels" $sel | nindent 4 }}
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "qd.roleSelectorLabels" $sel | nindent 4 }}
+  ports:
+    - name: admin
+      port: {{ .Values.service.ports.admin }}
+      targetPort: admin
+      protocol: TCP
+      appProtocol: http
+{{- if $s.pdb.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ include "qd.roleFullname" $sel }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.roleLabels" $sel | nindent 4 }}
+spec:
+  {{- if ne (toString $s.pdb.minAvailable) "" }}
+  minAvailable: {{ $s.pdb.minAvailable }}
+  {{- else }}
+  maxUnavailable: {{ $s.pdb.maxUnavailable | default 1 }}
+  {{- end }}
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      {{- include "qd.roleSelectorLabels" $sel | nindent 6 }}
+{{- end }}

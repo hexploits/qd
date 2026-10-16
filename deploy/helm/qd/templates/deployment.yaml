@@ -1,0 +1,156 @@
+{{- $credSecret := include "qd.credentialsSecretName" . -}}
+{{- if and (eq .Values.auth.mode "sigv4") (not $credSecret) }}
+{{- fail "auth.mode=sigv4 requires auth.existingSecret or auth.credentials" }}
+{{- end }}
+{{- /*
+Server role: the SQS API (+ admin endpoints). Never migrates and runs no background
+maintenance; see scheduler-deployment.yaml and migrate-job.yaml. The Deployment name and its
+selector are unchanged from the single-process layout so upgrades roll the existing pods.
+*/}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "qd.fullname" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.labels" . | nindent 4 }}
+    app.kubernetes.io/component: server
+spec:
+  {{- if not .Values.autoscaling.enabled }}
+  replicas: {{ .Values.replicaCount }}
+  {{- end }}
+  revisionHistoryLimit: {{ .Values.revisionHistoryLimit }}
+  strategy:
+    {{- toYaml .Values.updateStrategy | nindent 4 }}
+  selector:
+    matchLabels:
+      {{- include "qd.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "qd.labels" . | nindent 8 }}
+        app.kubernetes.io/component: server
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        {{- include "qd.podAnnotations" . | nindent 8 }}
+    spec:
+      serviceAccountName: {{ include "qd.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      initContainers:
+        # Block until every migration embedded in this image is applied (by the migrate Job,
+        # or by an operator running `qd migrate` when migrations.enabled=false).
+        {{- include "qd.utilityContainer" (dict "root" . "name" "wait-for-schema" "args" (list "wait-for-schema") "resources" .Values.initContainerResources) | nindent 8 }}
+      containers:
+        - name: qd
+          image: {{ include "qd.image" . | quote }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          args: ["server"]
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          ports:
+            - name: sqs
+              containerPort: {{ .Values.containerPorts.sqs }}
+              protocol: TCP
+            - name: admin
+              containerPort: {{ .Values.containerPorts.admin }}
+              protocol: TCP
+          envFrom:
+            {{- include "qd.envFrom" . | nindent 12 }}
+          env:
+            {{- include "qd.databaseEnv" . | nindent 12 }}
+            # Migrations are applied by the migrate Job; `server` never runs them.
+            - name: QD_RUN_MIGRATIONS
+              value: "false"
+            {{- with (include "qd.dogstatsdEnv" .) }}{{- . | nindent 12 }}{{- end }}
+            {{- if $credSecret }}
+            - name: QD_CREDENTIALS_FILE
+              value: {{ printf "%s/%s" (trimSuffix "/" .Values.auth.mountPath) (include "qd.credentialsSecretKey" .) | quote }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- if .Values.startupProbe.enabled }}
+          startupProbe:
+            {{- toYaml (omit .Values.startupProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if .Values.livenessProbe.enabled }}
+          livenessProbe:
+            {{- toYaml (omit .Values.livenessProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if .Values.readinessProbe.enabled }}
+          readinessProbe:
+            {{- toYaml (omit .Values.readinessProbe "enabled") | nindent 12 }}
+          {{- end }}
+          {{- if gt (int .Values.lifecycle.preStopSleepSeconds) 0 }}
+          lifecycle:
+            preStop:
+              sleep:
+                seconds: {{ int .Values.lifecycle.preStopSleepSeconds }}
+          {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+          volumeMounts:
+            {{- include "qd.commonVolumeMounts" . | nindent 12 }}
+            {{- if $credSecret }}
+            - name: credentials
+              mountPath: {{ .Values.auth.mountPath }}
+              readOnly: true
+            {{- end }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- if $credSecret }}
+        - name: credentials
+          secret:
+            secretName: {{ $credSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ include "qd.credentialsSecretKey" . }}
+                path: {{ include "qd.credentialsSecretKey" . }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- if .Values.topologySpreadConstraints }}
+      topologySpreadConstraints:
+        {{- tpl (toYaml .Values.topologySpreadConstraints) . | nindent 8 }}
+      {{- else if .Values.topologySpread.enabled }}
+      topologySpreadConstraints:
+        {{- range $k := list "zone" "node" }}
+        {{- $c := index $.Values.topologySpread $k }}
+        - maxSkew: {{ $c.maxSkew }}
+          topologyKey: {{ $c.topologyKey }}
+          whenUnsatisfiable: {{ $c.whenUnsatisfiable }}
+          labelSelector:
+            matchLabels:
+              {{- include "qd.selectorLabels" $ | nindent 14 }}
+          matchLabelKeys:
+            - pod-template-hash
+        {{- end }}
+      {{- end }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

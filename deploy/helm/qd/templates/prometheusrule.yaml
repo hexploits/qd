@@ -1,0 +1,92 @@
+{{- /*
+PrometheusRule rendered from files/prometheus-rules.yaml, a byte-identical copy of
+deploy/observability/prometheus-rules.yaml (the single source of truth; kept in sync by
+deploy/observability/sync-chart-files.sh and verified by deploy/observability/check.sh).
+
+Thresholds, the `up` job matcher and the runbook base URL are applied by replacing the literal
+defaults of the raw file. Each replacement is scoped to one alert and the template fails if the
+literal is missing, so the raw file and this mapping cannot silently drift apart.
+*/ -}}
+{{- if .Values.prometheusRule.enabled }}
+{{- $pr := .Values.prometheusRule }}
+{{- $t := $pr.thresholds }}
+{{- $raw := .Files.Get "files/prometheus-rules.yaml" }}
+{{- if not $raw }}
+{{- fail "files/prometheus-rules.yaml is missing from the chart (run deploy/observability/sync-chart-files.sh)" }}
+{{- end }}
+{{- $doc := fromYaml $raw }}
+{{- if hasKey $doc "Error" }}
+{{- fail (printf "files/prometheus-rules.yaml: %s" $doc.Error) }}
+{{- end }}
+{{- /* alert name -> list of [literal in the raw expr, replacement] */}}
+{{- $subs := dict
+  "QdServerErrorsHigh" (list (list "> 0.01" (printf "> %v" $t.serverErrorRatioWarning)))
+  "QdServerErrorsCritical" (list (list "> 0.05" (printf "> %v" $t.serverErrorRatioCritical)))
+  "QdHighLatency" (list (list "> 0.5" (printf "> %v" $t.latencyP99Seconds)))
+  "QdDBPoolSaturated" (list (list "> 0.9" (printf "> %v" $t.dbPoolUtilization)))
+  "QdJanitorFailing" (list (list "> 2" (printf "> %v" $t.janitorErrors15m)))
+  "QdQueueMetricsCollectionSlow" (list (list "> 20" (printf "> %v" $t.queueMetricsCollectionSeconds)))
+  "QdDeadLetterQueueNotEmpty" (list (list "> 0" (printf "> %v" $t.deadLetterQueueMessages)))
+  "QdOldestMessageTooOld" (list (list "> 3600" (printf "> %v" $t.oldestMessageAgeSeconds)))
+  "QdBacklogGrowing" (list (list "> 1000" (printf "> %v" $t.backlogMessages)))
+  "QdSchedulerDown" (list (list "> 120" (printf "> %v" $t.schedulerHeartbeatAgeSeconds)))
+}}
+{{- $jobFrom := `job=~".*qd.*"` }}
+{{- /* default: the server and scheduler Services (= ServiceMonitor jobs) of this release */}}
+{{- $defaultJob := printf "%s(-scheduler)?" (include "qd.fullname" . | regexQuoteMeta) }}
+{{- $jobTo := printf "job=~%s" ($pr.jobMatcher | default $defaultJob | toJson) }}
+{{- $runbookFrom := "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md" }}
+{{- $groups := list }}
+{{- range $g := $doc.groups }}
+{{- $rules := list }}
+{{- range $r := $g.rules }}
+{{- if and $r.alert (has $r.alert $pr.disabledAlerts) }}
+{{- /* dropped */}}
+{{- else }}
+{{- $expr := $r.expr | replace $jobFrom $jobTo }}
+{{- if $r.alert }}
+{{- range $s := (get $subs $r.alert | default list) }}
+{{- if not (contains (index $s 0) $expr) }}
+{{- fail (printf "prometheusRule: alert %s no longer contains %q; update templates/prometheusrule.yaml" $r.alert (index $s 0)) }}
+{{- end }}
+{{- $expr = replace (index $s 0) (index $s 1) $expr }}
+{{- end }}
+{{- $labels := merge (dict) ($r.labels | default dict) }}
+{{- $labels = merge $labels $pr.additionalAlertLabels }}
+{{- with $pr.severityOverrides }}
+{{- with get . $r.alert }}
+{{- $_ := set $labels "severity" . }}
+{{- end }}
+{{- end }}
+{{- $ann := merge (dict) ($r.annotations | default dict) }}
+{{- if $ann.runbook_url }}
+{{- $_ := set $ann "runbook_url" (replace $runbookFrom (trimSuffix "/" $pr.runbookBaseUrl) $ann.runbook_url) }}
+{{- end }}
+{{- $rules = append $rules (merge (dict "expr" $expr "labels" $labels "annotations" $ann) (omit $r "expr" "labels" "annotations")) }}
+{{- else }}
+{{- $rules = append $rules (merge (dict "expr" $expr) (omit $r "expr")) }}
+{{- end }}
+{{- end }}
+{{- end }}
+{{- if $rules }}
+{{- $groups = append $groups (merge (dict "rules" $rules) (omit $g "rules")) }}
+{{- end }}
+{{- end }}
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: {{ include "qd.fullname" . }}
+  namespace: {{ $pr.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "qd.labels" . | nindent 4 }}
+    {{- with $pr.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- with $pr.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  groups:
+    {{- toYaml $groups | nindent 4 }}
+{{- end }}

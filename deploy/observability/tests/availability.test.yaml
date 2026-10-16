@@ -1,0 +1,388 @@
+# promtool test rules deploy/observability/tests/*.test.yaml
+rule_files:
+  - ../prometheus-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------------------
+  - name: replica down (only jobs matching the qd matcher)
+    interval: 1m
+    input_series:
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '1 1 0x20'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '1x22'
+      - series: 'up{job="some-other-app", namespace="qd", instance="10.0.0.9:8080"}'
+        values: '0x22'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: QdReplicaDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: QdReplicaDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: 10.0.0.1:9325
+            exp_annotations:
+              summary: qd replica 10.0.0.1:9325 cannot be scraped
+              description: >-
+                Prometheus has failed to scrape 10.0.0.1:9325 (job qd,
+                namespace qd) for 5 minutes. The pod is down, crash-looping or its admin port is unreachable.
+              runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdreplicadown
+      # one of two replicas down is not a total outage
+      - eval_time: 10m
+        alertname: QdAllReplicasNotReady
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------
+  - name: one replica not ready
+    interval: 1m
+    input_series:
+      - series: 'qd_ready{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '1 0x10'
+      - series: 'qd_ready{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '1x11'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '1x11'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '1x11'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: QdNotReady
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: QdNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: 10.0.0.1:9325
+            exp_annotations:
+              summary: "qd replica 10.0.0.1:9325 is not ready"
+              description: "10.0.0.1:9325 has reported qd_ready=0 for 2 minutes: it cannot reach the database (or is stuck draining) and is out of the Service endpoints."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdnotready"
+      - eval_time: 5m
+        alertname: QdAllReplicasNotReady
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------
+  - name: all replicas not ready (scrapeable but qd_ready=0)
+    interval: 1m
+    input_series:
+      - series: 'qd_ready{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '1 0x10'
+      - series: 'qd_ready{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '1 0x10'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '1x11'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '1x11'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: QdAllReplicasNotReady
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: QdAllReplicasNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd qd/qd has no ready replica"
+              description: "No replica of qd in qd has been ready (or scrapeable) for 2 minutes. For the server job the SQS API is unavailable to clients; for the scheduler job background maintenance has stopped (see QdSchedulerDown). This is almost always the database: check Postgres / CloudNativePG health first."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdallreplicasnotready"
+
+  # ---------------------------------------------------------------------------------------
+  - name: all replicas down (no scrape succeeds, qd_ready absent)
+    interval: 1m
+    input_series:
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.1:9325"}'
+        values: '0x10'
+      - series: 'up{job="qd", namespace="qd", instance="10.0.0.2:9325"}'
+        values: '0x10'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: QdAllReplicasNotReady
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd qd/qd has no ready replica"
+              description: "No replica of qd in qd has been ready (or scrapeable) for 2 minutes. For the server job the SQS API is unavailable to clients; for the scheduler job background maintenance has stopped (see QdSchedulerDown). This is almost always the database: check Postgres / CloudNativePG health first."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdallreplicasnotready"
+
+  # ---------------------------------------------------------------------------------------
+  - name: 5xx ratio ~2% -> warning only
+    interval: 1m
+    input_series:
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", code="OK"}'
+        values: '0+100x20'
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", code="InternalFailure"}'
+        values: '0+2x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QdServerErrorsHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: QdServerErrorsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd 5xx error ratio is 1.961%"
+              description: "An elevated share (1.961%) of SQS API requests to qd (qd) failed with InternalFailure/ServiceUnavailable over the last 5 minutes."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdservererrorshigh"
+      - eval_time: 15m
+        alertname: QdServerErrorsCritical
+        exp_alerts: []
+
+  # ---------------------------------------------------------------------------------------
+  - name: 5xx ratio ~9% -> warning and critical
+    interval: 1m
+    input_series:
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="query", code="OK"}'
+        values: '0+100x20'
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="b", action="ReceiveMessage", protocol="json", code="ServiceUnavailable"}'
+        values: '0+10x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: QdServerErrorsCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd 5xx error ratio is 9.091%"
+              description: "A large share (9.091%) of SQS API requests to qd (qd) failed with InternalFailure/ServiceUnavailable over the last 5 minutes."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdservererrorscritical"
+      - eval_time: 15m
+        alertname: QdServerErrorsHigh
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd 5xx error ratio is 9.091%"
+              description: "An elevated share (9.091%) of SQS API requests to qd (qd) failed with InternalFailure/ServiceUnavailable over the last 5 minutes."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdservererrorshigh"
+
+  # ---------------------------------------------------------------------------------------
+  - name: client (4xx) errors do not count as server errors
+    interval: 1m
+    input_series:
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", code="OK"}'
+        values: '0+100x20'
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="GetQueueUrl", protocol="json", code="AWS.SimpleQueueService.NonExistentQueue"}'
+        values: '0+50x20'
+      - series: 'qd_requests_total{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", code="SignatureDoesNotMatch"}'
+        values: '0+50x20'
+    alert_rule_test:
+      - eval_time: 15m
+        alertname: QdServerErrorsHigh
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: QdServerErrorsCritical
+        exp_alerts: []
+    promql_expr_test:
+      # the ratio is 0, not absent, when there are no server errors
+      - expr: qd:requests_server_errors:ratio_rate5m
+        eval_time: 15m
+        exp_samples:
+          - labels: 'qd:requests_server_errors:ratio_rate5m{job="qd", namespace="qd"}'
+            value: 0
+
+  # ---------------------------------------------------------------------------------------
+  - name: p99 latency (ReceiveMessage long polls excluded)
+    interval: 1m
+    input_series:
+      # SendMessage: every request takes 0.5s-1s -> p99 ~0.995s
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", le="0.25"}'
+        values: '0x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", le="0.5"}'
+        values: '0x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", le="1"}'
+        values: '0+10x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="SendMessage", protocol="json", le="+Inf"}'
+        values: '0+10x30'
+      # DeleteMessage: fast (<10ms)
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="DeleteMessage", protocol="json", le="0.01"}'
+        values: '0+10x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="DeleteMessage", protocol="json", le="0.5"}'
+        values: '0+10x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="DeleteMessage", protocol="json", le="+Inf"}'
+        values: '0+10x30'
+      # ReceiveMessage: 20s long polls -> must not alert
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="ReceiveMessage", protocol="json", le="10"}'
+        values: '0x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="ReceiveMessage", protocol="json", le="21"}'
+        values: '0+10x30'
+      - series: 'qd_request_duration_seconds_bucket{job="qd", namespace="qd", instance="a", action="ReceiveMessage", protocol="json", le="+Inf"}'
+        values: '0+10x30'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: QdHighLatency
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: QdHighLatency
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              action: SendMessage
+            exp_annotations:
+              summary: "qd p99 latency for SendMessage is 995ms"
+              description: "The 99th percentile latency of SendMessage on qd (qd) has been above the alert threshold for 10 minutes (ReceiveMessage is excluded because it includes long polls)."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdhighlatency"
+
+  # ---------------------------------------------------------------------------------------
+  - name: version skew for more than an hour
+    interval: 1m
+    input_series:
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="a", role="server", version="0.1.0"}'
+        values: '1x120'
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="b", role="server", version="0.2.0"}'
+        values: '1x120'
+      # a second installation that is consistent
+      - series: 'qd_build_info{job="qd", namespace="other", instance="c", role="server", version="0.2.0"}'
+        values: '1x120'
+      - series: 'qd_build_info{job="qd", namespace="other", instance="d", role="server", version="0.2.0"}'
+        values: '1x120'
+      # scheduler and server of one installation on different versions (one job, e.g. pod
+      # annotation scraping): roles are compared separately -> no skew
+      - series: 'qd_build_info{job="qd", namespace="other", instance="e", role="scheduler", version="0.1.0"}'
+        values: '1x120'
+      - series: 'qd_build_info{job="qd", namespace="other", instance="f", role="scheduler", version="0.1.0"}'
+        values: '1x120'
+    alert_rule_test:
+      - eval_time: 30m
+        alertname: QdVersionSkew
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: QdVersionSkew
+        exp_alerts:
+          - exp_labels:
+              severity: info
+              job: qd
+              namespace: qd
+              role: server
+            exp_annotations:
+              summary: "qd replicas of qd run 2 different versions"
+              description: "Replicas of qd (role server) in qd have reported more than one qd_build_info version for over an hour. A rollout is probably stuck."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdversionskew"
+
+  # ---------------------------------------------------------------------------------------
+  - name: scheduler replica down (scheduler job matches the up matcher too)
+    interval: 1m
+    input_series:
+      - series: 'up{job="qd-scheduler", namespace="qd", instance="10.0.1.1:9325"}'
+        values: '1 0x20'
+      - series: 'up{job="qd-scheduler", namespace="qd", instance="10.0.1.2:9325"}'
+        values: '1x21'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QdReplicaDown
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd-scheduler
+              namespace: qd
+              instance: 10.0.1.1:9325
+            exp_annotations:
+              summary: qd replica 10.0.1.1:9325 cannot be scraped
+              description: >-
+                Prometheus has failed to scrape 10.0.1.1:9325 (job qd-scheduler,
+                namespace qd) for 5 minutes. The pod is down, crash-looping or its admin port is unreachable.
+              runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdreplicadown
+
+  # ---------------------------------------------------------------------------------------
+  - name: scheduler down (heartbeat ages on every server replica)
+    interval: 1m
+    input_series:
+      # heartbeats stop at minute 5: age 5s, then grows by 60s per minute
+      - series: 'qd_scheduler_heartbeat_age_seconds{job="qd", namespace="qd", instance="a"}'
+        values: '5 5 5 5 5 5+60x15'
+      - series: 'qd_scheduler_heartbeat_age_seconds{job="qd", namespace="qd", instance="b"}'
+        values: '3 3 3 3 3 3+60x15'
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="a", role="server", version="0.2.0"}'
+        values: '1x20'
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="b", role="server", version="0.2.0"}'
+        values: '1x20'
+      # another installation with a healthy scheduler: no alert
+      - series: 'qd_scheduler_heartbeat_age_seconds{job="qd", namespace="other", instance="c"}'
+        values: '7x20'
+      - series: 'qd_build_info{job="qd", namespace="other", instance="c", role="server", version="0.2.0"}'
+        values: '1x20'
+    alert_rule_test:
+      # age passes 120s at minute 7; `for: 5m` -> not yet at minute 10
+      - eval_time: 4m
+        alertname: QdSchedulerDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: QdSchedulerDown
+        exp_alerts: []
+      - eval_time: 14m
+        alertname: QdSchedulerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd qd/qd has no running scheduler"
+              description: "The API servers of qd in qd have seen no fresh scheduler heartbeat for 5 minutes (the newest is older than the alert threshold, or there is none). The SQS API keeps serving, but retention cleanup of expired messages, deleted-queue reclaim, DLQ redrive / message-move tasks and the per-queue gauges (and every queue alert built on them) have stopped."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdschedulerdown"
+
+  # ---------------------------------------------------------------------------------------
+  - name: scheduler never ran (servers up, no heartbeat gauge at all)
+    interval: 1m
+    input_series:
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="a", role="server", version="0.2.0"}'
+        values: '1x20'
+      # an all-in-one process runs its own scheduler: no heartbeat gauge needed, no alert
+      - series: 'qd_build_info{job="qd", namespace="dev", instance="x", role="all", version="0.2.0"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QdSchedulerDown
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: QdSchedulerDown
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+              job: qd
+              namespace: qd
+            exp_annotations:
+              summary: "qd qd/qd has no running scheduler"
+              description: "The API servers of qd in qd have seen no fresh scheduler heartbeat for 5 minutes (the newest is older than the alert threshold, or there is none). The SQS API keeps serving, but retention cleanup of expired messages, deleted-queue reclaim, DLQ redrive / message-move tasks and the per-queue gauges (and every queue alert built on them) have stopped."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdschedulerdown"
+
+  # ---------------------------------------------------------------------------------------
+  - name: scheduler healthy (fresh heartbeat, brief gap shorter than for)
+    interval: 1m
+    input_series:
+      # one stale stretch of 3 minutes (e.g. both schedulers restarting) stays below `for: 5m`
+      - series: 'qd_scheduler_heartbeat_age_seconds{job="qd", namespace="qd", instance="a"}'
+        values: '5 5 5 5 65 125 185 245 5 5 5 5 5 5 5 5 5 5 5 5 5'
+      - series: 'qd_build_info{job="qd", namespace="qd", instance="a", role="server", version="0.2.0"}'
+        values: '1x20'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QdSchedulerDown
+        exp_alerts: []
+      - eval_time: 20m
+        alertname: QdSchedulerDown
+        exp_alerts: []

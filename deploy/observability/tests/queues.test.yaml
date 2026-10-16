@@ -1,0 +1,138 @@
+# promtool test rules deploy/observability/tests/*.test.yaml
+#
+# Queue gauges are reported identically by every scheduler replica (instances a and b below); the rules
+# must aggregate them with max, not sum.
+rule_files:
+  - ../prometheus-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------------------
+  - name: dead-letter queue not empty
+    interval: 1m
+    input_series:
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq", state="visible"}'
+        values: '0 5x15'
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="b", account="000000000000", queue="orders-dlq", state="visible"}'
+        values: '0 5x15'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq", type="standard", is_dlq="true"}'
+        values: '1x16'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="b", account="000000000000", queue="orders-dlq", type="standard", is_dlq="true"}'
+        values: '1x16'
+      # an empty DLQ: no alert
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="payments-dlq", state="visible"}'
+        values: '0x16'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="payments-dlq", type="fifo", is_dlq="true"}'
+        values: '1x16'
+      # a busy regular queue: no alert
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders", state="visible"}'
+        values: '100x16'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders", type="standard", is_dlq="false"}'
+        values: '1x16'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QdDeadLetterQueueNotEmpty
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: QdDeadLetterQueueNotEmpty
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              account: "000000000000"
+              queue: orders-dlq
+            exp_annotations:
+              summary: dead-letter queue orders-dlq has 5 messages
+              description: >-
+                Dead-letter queue orders-dlq (account 000000000000) has held visible messages
+                for 5 minutes: consumers of its source queue(s) are failing to process messages.
+              runbook_url: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddeadletterqueuenotempty
+    promql_expr_test:
+      # max across replicas, not sum
+      - expr: qd:queue_messages:max{queue="orders-dlq"}
+        eval_time: 10m
+        exp_samples:
+          - labels: 'qd:queue_messages:max{job="qd", namespace="qd", account="000000000000", queue="orders-dlq", state="visible"}'
+            value: 5
+
+  # ---------------------------------------------------------------------------------------
+  - name: oldest message too old (DLQs excluded)
+    interval: 1m
+    input_series:
+      # age grows by 60s per minute (crosses 1h at t=60m), then stays at 80m from t=80m
+      # (a plateau keeps the annotation value deterministic)
+      - series: 'qd_queue_oldest_message_age_seconds{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders"}'
+        values: '0+60x80 4800x40'
+      - series: 'qd_queue_oldest_message_age_seconds{job="qd", namespace="qd", instance="b", account="000000000000", queue="orders"}'
+        values: '0+60x80 4800x40'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders", type="standard", is_dlq="false"}'
+        values: '1x120'
+      # old messages in a DLQ are expected; QdDeadLetterQueueNotEmpty covers them
+      - series: 'qd_queue_oldest_message_age_seconds{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq"}'
+        values: '86400+60x120'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq", type="standard", is_dlq="true"}'
+        values: '1x120'
+      # a healthy queue
+      - series: 'qd_queue_oldest_message_age_seconds{job="qd", namespace="qd", instance="a", account="000000000000", queue="events"}'
+        values: '5x120'
+    alert_rule_test:
+      - eval_time: 50m
+        alertname: QdOldestMessageTooOld
+        exp_alerts: []
+      - eval_time: 90m
+        alertname: QdOldestMessageTooOld
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              account: "000000000000"
+              queue: orders
+            exp_annotations:
+              summary: "oldest message in orders is 1h 20m 0s old"
+              description: "The oldest message in queue orders (account 000000000000) is 1h 20m 0s old (above the alert threshold) and has been for 15 minutes. Consumers are stalled or too slow. Dead-letter queues are excluded (see QdDeadLetterQueueNotEmpty)."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdoldestmessagetooold"
+
+  # ---------------------------------------------------------------------------------------
+  - name: backlog growing (DLQs and steady queues excluded)
+    interval: 1m
+    input_series:
+      # orders: +50 messages/min (above 1000 from t=10m) until t=40m, then flat at 2500 (the
+      # 30m regression is still positive at t=45m; the plateau keeps the annotation deterministic)
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders", state="visible"}'
+        values: '500+50x40 2500x50'
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="b", account="000000000000", queue="orders", state="visible"}'
+        values: '500+50x40 2500x50'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders", type="standard", is_dlq="false"}'
+        values: '1x90'
+      # batch: large but steady
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="batch", state="visible"}'
+        values: '5000x90'
+      # small growing queue below the depth threshold
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="tiny", state="visible"}'
+        values: '0+5x90'
+      # growing DLQ: excluded
+      - series: 'qd_queue_messages{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq", state="visible"}'
+        values: '2000+50x90'
+      - series: 'qd_queue_info{job="qd", namespace="qd", instance="a", account="000000000000", queue="orders-dlq", type="standard", is_dlq="true"}'
+        values: '1x90'
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: QdBacklogGrowing
+        exp_alerts: []
+      - eval_time: 45m
+        alertname: QdBacklogGrowing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              account: "000000000000"
+              queue: orders
+              state: visible
+            exp_annotations:
+              summary: "backlog of orders keeps growing"
+              description: "Queue orders (account 000000000000) has 2500 visible messages (above the alert threshold) and its depth has trended upwards for the last 30+ minutes: producers are outpacing consumers."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdbackloggrowing"

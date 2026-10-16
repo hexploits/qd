@@ -1,0 +1,168 @@
+# promtool test rules deploy/observability/tests/*.test.yaml
+rule_files:
+  - ../prometheus-rules.yaml
+
+evaluation_interval: 1m
+
+tests:
+  # ---------------------------------------------------------------------------------------
+  - name: database errors
+    interval: 1m
+    input_series:
+      - series: 'qd_db_errors_total{job="qd", namespace="qd", instance="a", kind="unavailable"}'
+        values: '0+5x20'
+      - series: 'qd_db_errors_total{job="qd", namespace="qd", instance="b", kind="other"}'
+        values: '3x20'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QdDatabaseErrors
+        exp_alerts: []
+      - eval_time: 10m
+        alertname: QdDatabaseErrors
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: a
+              kind: unavailable
+            exp_annotations:
+              summary: "qd replica a is seeing database errors (unavailable)"
+              description: "a has been recording \"unavailable\" database errors for 5 minutes (83.33m/s)."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddatabaseerrors"
+
+  # ---------------------------------------------------------------------------------------
+  - name: notifier disconnected
+    interval: 1m
+    input_series:
+      - series: 'qd_notifier_connected{job="qd", namespace="qd", instance="a"}'
+        values: '1 0x10'
+      - series: 'qd_notifier_connected{job="qd", namespace="qd", instance="b"}'
+        values: '1x11'
+      # brief reconnect blip on c must not alert
+      - series: 'qd_notifier_connected{job="qd", namespace="qd", instance="c"}'
+        values: '1 0 0 1x8'
+    alert_rule_test:
+      - eval_time: 3m
+        alertname: QdNotifierDisconnected
+        exp_alerts: []
+      - eval_time: 8m
+        alertname: QdNotifierDisconnected
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: a
+            exp_annotations:
+              summary: "qd replica a lost its LISTEN connection"
+              description: "The cross-replica notification (LISTEN/NOTIFY) connection of a has been down for 5 minutes. Long polls on this replica only notice messages sent via other replicas on their periodic re-check, so receive latency increases."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdnotifierdisconnected"
+
+  # ---------------------------------------------------------------------------------------
+  - name: DB pool saturation
+    interval: 1m
+    input_series:
+      - series: 'qd_db_pool_connections{job="qd", namespace="qd", instance="a", state="in_use"}'
+        values: '30x20'
+      - series: 'qd_db_pool_connections{job="qd", namespace="qd", instance="a", state="idle"}'
+        values: '2x20'
+      - series: 'qd_db_pool_max_connections{job="qd", namespace="qd", instance="a"}'
+        values: '32x20'
+      - series: 'qd_db_pool_connections{job="qd", namespace="qd", instance="b", state="in_use"}'
+        values: '10x20'
+      - series: 'qd_db_pool_connections{job="qd", namespace="qd", instance="b", state="idle"}'
+        values: '22x20'
+      - series: 'qd_db_pool_max_connections{job="qd", namespace="qd", instance="b"}'
+        values: '32x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: QdDBPoolSaturated
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: QdDBPoolSaturated
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: a
+            exp_annotations:
+              summary: "qd replica a DB pool is 93.75% in use"
+              description: "The database pool of a has been nearly exhausted (93.75% in use) for 10 minutes. Requests will start waiting for connections (and time out after QD_DB_ACQUIRE_TIMEOUT_SECS)."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qddbpoolsaturated"
+    promql_expr_test:
+      - expr: qd:db_pool_utilization:ratio
+        eval_time: 15m
+        exp_samples:
+          - labels: 'qd:db_pool_utilization:ratio{job="qd", namespace="qd", instance="a"}'
+            value: 0.9375
+          - labels: 'qd:db_pool_utilization:ratio{job="qd", namespace="qd", instance="b"}'
+            value: 0.3125
+
+  # ---------------------------------------------------------------------------------------
+  - name: janitor failing
+    interval: 1m
+    input_series:
+      # every pass fails (~1/min here)
+      - series: 'qd_janitor_runs_total{job="qd", namespace="qd", instance="a", result="error"}'
+        values: '0+1x30'
+      - series: 'qd_janitor_runs_total{job="qd", namespace="qd", instance="a", result="ok"}'
+        values: '0x30'
+      # one isolated failure among many successes: no alert
+      - series: 'qd_janitor_runs_total{job="qd", namespace="qd", instance="b", result="error"}'
+        values: '0 0 1x29'
+      - series: 'qd_janitor_runs_total{job="qd", namespace="qd", instance="b", result="ok"}'
+        values: '0+6x30'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: QdJanitorFailing
+        exp_alerts: []
+      - eval_time: 15m
+        alertname: QdJanitorFailing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: a
+              result: error
+            exp_annotations:
+              summary: "qd janitor is failing on a"
+              description: "15 background maintenance passes failed on a in the last 15 minutes. Expired messages, receipts and deduplication entries are not being cleaned up."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdjanitorfailing"
+
+  # ---------------------------------------------------------------------------------------
+  - name: queue metrics collection slow
+    interval: 1m
+    input_series:
+      # a: collections take 10-21s
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="a", le="10"}'
+        values: '0x60'
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="a", le="21"}'
+        values: '0+2x60'
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="a", le="+Inf"}'
+        values: '0+2x60'
+      # b: fast (<100ms)
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="b", le="0.1"}'
+        values: '0+2x60'
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="b", le="10"}'
+        values: '0+2x60'
+      - series: 'qd_queue_metrics_collection_seconds_bucket{job="qd", namespace="qd", instance="b", le="+Inf"}'
+        values: '0+2x60'
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: QdQueueMetricsCollectionSlow
+        exp_alerts: []
+      - eval_time: 40m
+        alertname: QdQueueMetricsCollectionSlow
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              job: qd
+              namespace: qd
+              instance: a
+            exp_annotations:
+              summary: "qd queue metrics collection is slow on a"
+              description: "Collecting per-queue gauges takes 20.89s (p99) on a. Queue depth/age gauges are stale and the collection query is loading the database. Raise QD_QUEUE_METRICS_INTERVAL_SECS or investigate table bloat."
+              runbook_url: "https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md#qdqueuemetricscollectionslow"

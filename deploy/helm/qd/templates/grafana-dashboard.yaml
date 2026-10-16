@@ -1,0 +1,35 @@
+{{- /*
+Grafana dashboard ConfigMap for the Grafana sidecar (kube-prometheus-stack / grafana chart).
+files/grafana-dashboard.json is a byte-identical copy of deploy/observability/grafana-dashboard.json
+(single source of truth; see deploy/observability/sync-chart-files.sh).
+*/ -}}
+{{- if .Values.grafanaDashboard.enabled }}
+{{- $gd := .Values.grafanaDashboard }}
+{{- $json := .Files.Get "files/grafana-dashboard.json" }}
+{{- if not $json }}
+{{- fail "files/grafana-dashboard.json is missing from the chart (run deploy/observability/sync-chart-files.sh)" }}
+{{- end }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ printf "%s-dashboard" (include "qd.fullname" .) | trunc 63 | trimSuffix "-" }}
+  namespace: {{ $gd.namespace | default .Release.Namespace }}
+  labels:
+    {{- include "qd.labels" . | nindent 4 }}
+    {{ $gd.sidecarLabel }}: {{ $gd.sidecarLabelValue | quote }}
+    {{- with $gd.labels }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- if or $gd.folder $gd.annotations }}
+  annotations:
+    {{- with $gd.folder }}
+    {{ $gd.folderAnnotation }}: {{ . | quote }}
+    {{- end }}
+    {{- with $gd.annotations }}
+    {{- toYaml . | nindent 4 }}
+    {{- end }}
+  {{- end }}
+data:
+  qd.json: |-
+    {{- $json | trimSuffix "\n" | nindent 4 }}
+{{- end }}

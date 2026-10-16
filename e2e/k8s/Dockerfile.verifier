@@ -1,0 +1,10 @@
+# In-cluster delivery-guarantee verifier (crates/qd-e2e/examples/verify.rs).
+FROM docker.io/library/rust:1-bookworm AS builder
+WORKDIR /src
+COPY . .
+RUN cargo build --release --locked -p qd-e2e --example verify \
+ && install -D -m 0755 target/release/examples/verify /out/verify
+
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=builder /out/verify /usr/local/bin/verify
+ENTRYPOINT ["/usr/local/bin/verify"]

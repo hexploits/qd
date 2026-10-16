@@ -1,0 +1,84 @@
+{{- /*
+Database migrations as a plain Job (NOT a Helm hook): with postgresql.cnpg.enabled the Postgres
+Cluster is created by this same release, so at install time the database (and its `-app`
+Secret) does not exist yet. A pre-install hook would block the release before the Cluster is
+even created; a regular Job is created alongside it and `qd migrate` waits for the
+database (QD_MIGRATE_TIMEOUT_SECS). Scheduler and server pods wait for the schema in their
+`wait-for-schema` init containers, so the rollout order is: Job migrates -> scheduler + server
+start in parallel. No other process touches the schema.
+
+The name carries the release revision: Jobs are immutable, so every `helm upgrade` (and
+rollback) creates a fresh Job, and Helm deletes the previous revision's Job.
+
+restartPolicy Never: each failed attempt leaves its pod (and logs) behind for `kubectl logs`,
+and backoffLimit counts attempts. The command already retries the DB connection internally, so
+pod-level retries are only for crashes/evictions.
+*/}}
+{{- if .Values.migrations.enabled }}
+{{- $m := .Values.migrations }}
+{{- $sel := dict "root" . "role" "migrate" }}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ printf "%s-%s" (include "qd.roleFullname" $sel | trunc 52 | trimSuffix "-") ($m.jobNameSuffix | default (toString .Release.Revision)) }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "qd.roleLabels" $sel | nindent 4 }}
+  {{- with $m.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  backoffLimit: {{ $m.backoffLimit }}
+  activeDeadlineSeconds: {{ $m.activeDeadlineSeconds }}
+  {{- if ne (toString $m.ttlSecondsAfterFinished) "" }}
+  ttlSecondsAfterFinished: {{ $m.ttlSecondsAfterFinished }}
+  {{- end }}
+  template:
+    metadata:
+      labels:
+        {{- include "qd.roleLabels" $sel | nindent 8 }}
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with $m.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      restartPolicy: Never
+      serviceAccountName: {{ include "qd.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      enableServiceLinks: false
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.priorityClassName }}
+      priorityClassName: {{ . }}
+      {{- end }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      {{- $env := list (dict "name" "QD_MIGRATE_TIMEOUT_SECS" "value" (toString (int $m.waitForDatabaseSeconds))) }}
+      containers:
+        {{- include "qd.utilityContainer" (dict "root" . "name" "migrate" "args" (list "migrate") "resources" $m.resources "env" $env) | nindent 8 }}
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      {{- with ($m.nodeSelector | default .Values.nodeSelector) }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with ($m.tolerations | default .Values.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with $m.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

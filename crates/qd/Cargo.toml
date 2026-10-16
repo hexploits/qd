@@ -1,0 +1,32 @@
+[package]
+name = "qd"
+description = "Highly-available, Postgres-backed, AWS SQS-compatible message queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "qd"
+path = "src/main.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+qd-engine.workspace = true
+qd-sqs.workspace = true
+anyhow.workspace = true
+axum.workspace = true
+clap.workspace = true
+metrics.workspace = true
+metrics-exporter-prometheus.workspace = true
+metrics-exporter-dogstatsd.workspace = true
+metrics-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+sqlx.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

@@ -1,0 +1,668 @@
+# Default values for qd.
+#
+# qd is stateless: run as many replicas as you like against one Postgres database.
+# High availability = N replicas (this chart) + PodDisruptionBudget + topology spread
+#                     + an HA Postgres (CloudNativePG recommended, see `postgresql.cnpg`).
+#
+# The chart deploys the binary in three roles (one image, different subcommands):
+#   1. migrate   Job `<fullname>-migrate-<revision>` (`qd migrate`): waits for the
+#                database, applies the embedded migrations, exits. See `migrations`.
+#   2. scheduler Deployment `<fullname>-scheduler` (`qd scheduler`): background
+#                maintenance (retention, deleted-queue reclaim, DLQ redrive / message-move tasks,
+#                per-queue gauges, heartbeat). See `scheduler`.
+#   3. server    Deployment `<fullname>` (`qd server`): the SQS API behind the
+#                Service `<fullname>`. The top-level pod/container values below (replicaCount,
+#                resources, probes, topologySpread, nodeSelector, ...) configure this role.
+#   (2. and 3. start in parallel once 1. has applied the schema.)
+#
+# Rollout order (install and upgrade), enforced by init containers rather than Helm hooks:
+#   migrations first (the migrate Job), then scheduler + server in parallel: both Deployments
+#   have a single `wait-for-schema` init container and start once every migration embedded in
+#   their image is applied. No process touches the schema until the migrate Job has finished
+#   (neither role ever runs migrations; both also wait for the schema internally). The server
+#   does not wait for the scheduler: a scheduler outage never blocks the API.
+# During an upgrade the old pods keep serving while the new schema is applied: migrations are
+# backwards compatible (expand/contract), so the previous release runs fine on the new schema.
+
+# -- Override the chart name used in resource names.
+nameOverride: ""
+# -- Override the full resource name prefix.
+fullnameOverride: ""
+
+image:
+  # -- Container image repository.
+  repository: registry.hexploits.cloud/hexploits/services/simply-queued
+  # -- Image tag. Defaults to the chart's appVersion.
+  tag: ""
+  # -- Optional image digest (sha256:...). Takes precedence over `tag` when set.
+  digest: ""
+  pullPolicy: IfNotPresent
+
+# -- Image pull secrets, e.g. [{name: gitlab-registry}].
+imagePullSecrets: []
+
+# -- Number of SERVER (SQS API) replicas (ignored when autoscaling.enabled=true). 3 survives a
+# zone/node loss while a rolling update is in progress. Scheduler replicas: scheduler.replicaCount.
+replicaCount: 3
+
+# -- Old ReplicaSets to keep for `kubectl rollout undo`.
+revisionHistoryLimit: 5
+
+updateStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    # Never drop below the desired replica count during a rollout.
+    maxUnavailable: 0
+    maxSurge: 1
+
+###############################################################################
+# Application configuration (rendered into a ConfigMap as QD_* environment variables)
+###############################################################################
+config:
+  # -- AWS region reported in queue ARNs/URLs (QD_REGION).
+  region: us-east-1
+  # -- Account id used when auth is disabled or a credential has no account (QD_DEFAULT_ACCOUNT_ID).
+  defaultAccountId: "000000000000"
+  # -- Base URL advertised in queue URLs (QD_PUBLIC_URL), e.g. https://sqs.example.com.
+  # When empty, the URL is derived from each request's Host header, which is what you want
+  # for in-cluster clients using the Service DNS name. Set it when clients reach the
+  # service through an Ingress / load balancer under a different name.
+  publicUrl: ""
+  # -- DEPRECATED, ignored. Migrations are applied by the migrate Job (see `migrations`); the
+  # server and scheduler pods always run with QD_RUN_MIGRATIONS=false.
+  runMigrations: true
+  # -- Allow principals to access queues owned by other accounts (QD_ALLOW_CROSS_ACCOUNT).
+  allowCrossAccount: false
+  # -- How long a replica may cache queue metadata, ms (QD_QUEUE_CACHE_TTL_MS).
+  queueCacheTtlMs: 1000
+  # -- Minimum seconds between PurgeQueue calls per queue (QD_PURGE_COOLDOWN_SECS).
+  purgeCooldownSecs: 60
+  # -- Background maintenance interval (QD_JANITOR_INTERVAL_SECS). Used by the scheduler pods.
+  janitorIntervalSecs: 10
+  # -- Per-queue depth gauge refresh interval; 0 disables (QD_QUEUE_METRICS_INTERVAL_SECS).
+  # Used by the scheduler pods (the only role that exports per-queue gauges).
+  queueMetricsIntervalSecs: 30
+  # -- In-flight drain budget after SIGTERM (QD_SHUTDOWN_GRACE_SECS). Keep
+  # terminationGracePeriodSeconds > lifecycle.preStopSleepSeconds + this value.
+  shutdownGraceSecs: 25
+  # -- Maximum HTTP request body (QD_MAX_BODY_BYTES).
+  maxBodyBytes: 8388608
+  # -- Log format: json or text (QD_LOG_FORMAT).
+  logFormat: json
+  # -- tracing filter (QD_LOG), e.g. "info,sqlx=warn" or "debug".
+  logLevel: "info,sqlx=warn"
+  db:
+    # -- Pool size per server replica (QD_DB_MAX_CONNECTIONS; schedulers use
+    # scheduler.dbMaxConnections). Total = server replicas * this + scheduler replicas *
+    # scheduler.dbMaxConnections + 1 migrate pod; keep it below Postgres max_connections
+    # (minus superuser/replication reserves).
+    maxConnections: 32
+    # -- Idle connections kept open per replica (QD_DB_MIN_CONNECTIONS).
+    minConnections: 2
+    # -- Seconds to wait for a pooled connection (QD_DB_ACQUIRE_TIMEOUT_SECS).
+    acquireTimeoutSecs: 5
+    # -- Server-side statement_timeout, ms (QD_DB_STATEMENT_TIMEOUT_MS).
+    statementTimeoutMs: 30000
+
+# -- Extra environment variables for every container of every role (server, scheduler, migrate
+# Job and the init containers), list of EnvVar. Put DB/TLS settings here.
+extraEnv: []
+#  - name: QD_LOG
+#    value: debug
+# -- Extra envFrom sources for every container (list of EnvFromSource).
+extraEnvFrom: []
+
+###############################################################################
+# Database connection
+#
+# Exactly one source is used, in this order of precedence:
+#   1. database.existingSecret        - a Secret you manage (recommended)
+#   2. postgresql.cnpg.enabled=true   - the `<cluster>-app` Secret generated by CloudNativePG
+#   3. database.url                   - chart creates a Secret from this value (dev/test)
+#   4. none of the above              - the pods expect a Secret named `<fullname>-db` with key
+#                                       `database-url`, which you create yourself (see NOTES)
+###############################################################################
+database:
+  # -- Postgres URL, e.g. postgres://user:pass@host:5432/qd?sslmode=require.
+  # Stored in a chart-managed Secret. Prefer existingSecret for production.
+  url: ""
+  # -- Name of an existing Secret holding the database URL.
+  existingSecret: ""
+  # -- Key inside existingSecret.
+  existingSecretKey: database-url
+
+###############################################################################
+# Authentication (AWS SigV4)
+###############################################################################
+auth:
+  # -- none (accept any request) or sigv4 (verify AWS Signature V4) (QD_AUTH_MODE).
+  mode: none
+  # -- Credentials rendered into a chart-managed Secret (dev/test). Each entry:
+  # {accessKeyId, secretAccessKey, accountId (optional)}.
+  credentials: []
+  #  - accessKeyId: AKIAEXAMPLE
+  #    secretAccessKey: change-me
+  #    accountId: "123456789012"
+  # -- Existing Secret containing a credentials file: one `ACCESS_KEY_ID:SECRET[:ACCOUNT_ID]`
+  # per line, `#` comments allowed. Mounted read-only and wired via QD_CREDENTIALS_FILE.
+  existingSecret: ""
+  # -- Key inside existingSecret that holds the credentials file.
+  existingSecretKey: credentials
+  # -- Directory the credentials Secret is mounted at.
+  mountPath: /etc/qd/auth
+
+###############################################################################
+# Pod / container
+###############################################################################
+serviceAccount:
+  # -- Create a ServiceAccount.
+  create: true
+  # -- Name of the ServiceAccount (generated when empty and create=true).
+  name: ""
+  annotations: {}
+  # -- qd never talks to the Kubernetes API.
+  automountServiceAccountToken: false
+
+# -- Annotations for the server and scheduler pods.
+podAnnotations: {}
+# -- Labels for the pods of every role.
+podLabels: {}
+# -- Optional PriorityClass for the pods (scheduler.priorityClassName overrides it for schedulers).
+priorityClassName: ""
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  runAsNonRoot: true
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  privileged: false
+  capabilities:
+    drop: ["ALL"]
+  seccompProfile:
+    type: RuntimeDefault
+
+# -- Server container resources.
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+containerPorts:
+  sqs: 9324
+  admin: 9325
+
+# -- Must exceed lifecycle.preStopSleepSeconds + config.shutdownGraceSecs (long polls are up to 20s).
+terminationGracePeriodSeconds: 40
+
+lifecycle:
+  # -- Seconds to sleep in preStop so endpoints/load balancers stop routing to the pod before
+  # SIGTERM. Uses the native `sleep` lifecycle action (the image has no shell): requires
+  # Kubernetes >= 1.30 (or 1.29 with the PodLifecycleSleepAction gate). 0 disables it; the
+  # server also flips /readyz to 503 on SIGTERM and keeps serving while it drains.
+  preStopSleepSeconds: 5
+
+# -- Resources of the `wait-for-schema` init containers (server and scheduler).
+initContainerResources:
+  requests:
+    cpu: 10m
+    memory: 32Mi
+  limits:
+    memory: 128Mi
+
+# Server probes, all on the admin port. /healthz = liveness (the process is alive), /readyz =
+# readiness (DB reachable and not draining). (/livez no longer exists.)
+startupProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+    port: admin
+  periodSeconds: 2
+  timeoutSeconds: 2
+  # 2s * 90 = up to 3 minutes for the DB connection on boot (migrations already ran in the Job;
+  # init containers waited for the schema).
+  failureThreshold: 90
+
+livenessProbe:
+  enabled: true
+  httpGet:
+    path: /healthz
+    port: admin
+  periodSeconds: 10
+  timeoutSeconds: 3
+  failureThreshold: 3
+
+readinessProbe:
+  enabled: true
+  httpGet:
+    path: /readyz
+    port: admin
+  periodSeconds: 5
+  timeoutSeconds: 3
+  failureThreshold: 2
+  successThreshold: 1
+
+# Spread server replicas across zones and nodes.
+topologySpread:
+  enabled: true
+  zone:
+    maxSkew: 1
+    topologyKey: topology.kubernetes.io/zone
+    # ScheduleAnyway keeps single-zone clusters working; use DoNotSchedule for strict spreading.
+    whenUnsatisfiable: ScheduleAnyway
+  node:
+    maxSkew: 1
+    topologyKey: kubernetes.io/hostname
+    whenUnsatisfiable: ScheduleAnyway
+# -- Raw topologySpreadConstraints; when non-empty, replaces the generated ones above.
+topologySpreadConstraints: []
+
+# Server scheduling constraints (also the default nodeSelector/tolerations of the migrate Job).
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# -- Extra volumes / mounts for every container of every role (e.g. a CA bundle for
+# sslmode=verify-full).
+extraVolumes: []
+extraVolumeMounts: []
+
+###############################################################################
+# Scheduler role: background workers (retention janitor, deleted-queue reclaim, DLQ redrive /
+# message-move tasks, per-queue metric gauges, heartbeat row every 10s). Admin endpoints only
+# (/healthz, /readyz, /metrics on containerPorts.admin), exposed by the ClusterIP Service
+# `<fullname>-scheduler` for scraping. Runs safely with several replicas (idempotent work with
+# SKIP LOCKED, no leader election), so 2 replicas give HA. If no scheduler runs, the API keeps
+# serving but expired messages are not cleaned up, deleted queues are not reclaimed, redrives
+# stall and per-queue gauges stop (alert: QdSchedulerDown).
+# Shares image, serviceAccount, podSecurityContext/securityContext, extraEnv/extraVolumes and the
+# ConfigMap (config.*) with the server.
+###############################################################################
+scheduler:
+  # -- Number of scheduler replicas.
+  replicaCount: 2
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # -- DB pool size per scheduler replica (QD_DB_MAX_CONNECTIONS). Empty = config.db.maxConnections.
+  dbMaxConnections: 10
+  # -- Extra env for the scheduler container only (after extraEnv, so it wins).
+  extraEnv: []
+  podAnnotations: {}
+  podLabels: {}
+  # -- PriorityClass for the scheduler pods (default: priorityClassName).
+  priorityClassName: ""
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # -- Must exceed lifecycle.preStopSleepSeconds + config.shutdownGraceSecs.
+  terminationGracePeriodSeconds: 40
+  lifecycle:
+    # -- preStop sleep before SIGTERM (native sleep action, Kubernetes >= 1.30). 0 disables it.
+    preStopSleepSeconds: 5
+  startupProbe:
+    enabled: true
+    httpGet:
+      path: /healthz
+      port: admin
+    periodSeconds: 2
+    timeoutSeconds: 2
+    failureThreshold: 90
+  livenessProbe:
+    enabled: true
+    httpGet:
+      path: /healthz
+      port: admin
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+  readinessProbe:
+    enabled: true
+    httpGet:
+      path: /readyz
+      port: admin
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 2
+    successThreshold: 1
+  pdb:
+    # -- PodDisruptionBudget for the scheduler pods.
+    enabled: true
+    # -- minAvailable wins when set; otherwise maxUnavailable is used.
+    minAvailable: 1
+    maxUnavailable: ""
+  # Spread scheduler replicas across zones and nodes (same defaults as the server).
+  topologySpread:
+    enabled: true
+    zone:
+      maxSkew: 1
+      topologyKey: topology.kubernetes.io/zone
+      whenUnsatisfiable: ScheduleAnyway
+    node:
+      maxSkew: 1
+      topologyKey: kubernetes.io/hostname
+      whenUnsatisfiable: ScheduleAnyway
+  # -- Raw topologySpreadConstraints; when non-empty, replaces the generated ones above.
+  topologySpreadConstraints: []
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+
+###############################################################################
+# Database migrations: a Job `<fullname>-migrate-<revision>` running `qd migrate`.
+# It is a plain Job (not a Helm hook) so it also works when the CNPG Cluster is created by this
+# release: the database is not up at install time, and the command waits for it. Every
+# install/upgrade/rollback gets a fresh Job (Jobs are immutable); Helm removes the previous one.
+# Migrations are advisory-locked (concurrent runs are safe) and backwards compatible, so pods of
+# the previous release keep serving during an upgrade.
+#
+# With migrations.enabled=false nothing applies the schema: run `qd migrate` (same
+# image, same QD_DATABASE_URL) yourself before installing/upgrading. Scheduler and server pods
+# wait in their `wait-for-schema` init container until you do.
+#
+# GitOps (Argo CD / Flux rendering with `helm template`): .Release.Revision is constant there, so
+# set `jobNameSuffix` (e.g. to the image tag) and/or annotate the Job so the tool replaces it,
+# e.g. annotations: {argocd.argoproj.io/sync-options: Replace=true}.
+###############################################################################
+migrations:
+  # -- Create the migrate Job.
+  enabled: true
+  # -- Retries (pods) before the Job is marked failed.
+  backoffLimit: 10
+  # -- Hard deadline for the whole Job, seconds (must exceed waitForDatabaseSeconds).
+  activeDeadlineSeconds: 900
+  # -- Delete the finished Job after this many seconds (empty = keep).
+  ttlSecondsAfterFinished: 86400
+  # -- How long `migrate` waits for the database to become reachable (QD_MIGRATE_TIMEOUT_SECS).
+  waitForDatabaseSeconds: 600
+  # -- Job name suffix; empty = the Helm release revision.
+  jobNameSuffix: ""
+  annotations: {}
+  podAnnotations: {}
+  resources:
+    requests:
+      cpu: 50m
+      memory: 64Mi
+    limits:
+      memory: 256Mi
+  # -- nodeSelector for the Job (default: nodeSelector).
+  nodeSelector: {}
+  # -- tolerations for the Job (default: tolerations).
+  tolerations: []
+  affinity: {}
+
+###############################################################################
+# Service
+###############################################################################
+service:
+  # -- ClusterIP, NodePort or LoadBalancer.
+  type: ClusterIP
+  ports:
+    # -- Service port for the SQS API. Set to 80 so clients can use
+    # endpoint_url=http://<service>.<namespace>.svc without a port.
+    sqs: 9324
+    # -- Service port for the admin endpoints (health + /metrics).
+    admin: 9325
+  # -- nodePorts when type=NodePort/LoadBalancer, e.g. {sqs: 30924, admin: 30925}.
+  nodePorts: {}
+  annotations: {}
+  labels: {}
+  # -- Cluster / Local (LoadBalancer & NodePort only).
+  externalTrafficPolicy: ""
+  loadBalancerSourceRanges: []
+  # -- Expose the admin port on the Service (needed for the ServiceMonitor).
+  exposeAdmin: true
+
+###############################################################################
+# Ingress (optional). Remember: ReceiveMessage long polls last up to 20s, so make
+# sure the controller's read timeout is > 20s (nginx: proxy-read-timeout).
+###############################################################################
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  #  nginx.ingress.kubernetes.io/proxy-read-timeout: "60"
+  #  nginx.ingress.kubernetes.io/proxy-body-size: "16m"
+  hosts:
+    - host: sqs.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls: []
+  #  - secretName: sqs-example-com-tls
+  #    hosts: [sqs.example.com]
+
+###############################################################################
+# Availability & scaling
+###############################################################################
+# Server PodDisruptionBudget (scheduler: scheduler.pdb).
+podDisruptionBudget:
+  enabled: true
+  # -- minAvailable wins when set; otherwise maxUnavailable is used.
+  maxUnavailable: 1
+  minAvailable: ""
+
+# HPA for the server Deployment.
+autoscaling:
+  enabled: false
+  minReplicas: 3
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: ""
+  # -- Optional HPA scaling behavior.
+  behavior: {}
+
+###############################################################################
+# Observability
+###############################################################################
+metrics:
+  # -- Add prometheus.io/* scrape annotations (admin port, /metrics) to the pods: an opt-in
+  # alternative to the ServiceMonitor for Prometheus setups using annotation-based discovery.
+  podAnnotations: false
+  serviceMonitor:
+    # -- Create a prometheus-operator ServiceMonitor scraping the admin port /metrics of both the
+    # server Service (`<fullname>`, job `<fullname>`) and the scheduler Service
+    # (`<fullname>-scheduler`, job `<fullname>-scheduler`) (requires the CRD).
+    enabled: false
+    namespace: ""
+    # -- Extra labels, e.g. {release: kube-prometheus-stack} to match the Prometheus serviceMonitorSelector.
+    labels: {}
+    # -- Scrape interval. Queue gauges refresh every config.queueMetricsIntervalSecs (30s).
+    interval: 30s
+    scrapeTimeout: 10s
+    relabelings: []
+    metricRelabelings: []
+  # Push metrics to a Prometheus Pushgateway (for environments that cannot scrape the pods).
+  pushgateway:
+    # -- Pushgateway base URL, e.g. http://pushgateway.monitoring:9091 (QD_METRICS_PUSHGATEWAY_URL). Empty disables.
+    url: ""
+    # -- Push interval in seconds (QD_METRICS_PUSH_INTERVAL_SECS).
+    intervalSecs: 15
+    # -- Pushgateway job label (QD_METRICS_PUSH_JOB).
+    job: qd
+    # -- Pushgateway instance label (QD_METRICS_INSTANCE). Empty = pod name ($HOSTNAME).
+    instance: ""
+  # Send metrics to a DogStatsD agent (Datadog). Histograms are sent as distributions.
+  dogstatsd:
+    # -- Enable the DogStatsD exporter (sets QD_METRICS_DOGSTATSD_ADDR).
+    enabled: false
+    # -- Agent host. Empty = the node IP (status.hostIP), i.e. the Datadog Agent DaemonSet's
+    # DogStatsD hostPort. Set e.g. to a Service name when the agent runs as a cluster service.
+    host: ""
+    port: 8125
+    # -- Metric name prefix (QD_METRICS_DOGSTATSD_PREFIX), e.g. "qd".
+    prefix: ""
+  # Datadog Agent OpenMetrics check via Autodiscovery pod annotations (scrapes /metrics; an
+  # alternative to DogStatsD -- enable one or the other, not both).
+  datadogAutodiscovery:
+    # -- Add the ad.datadoghq.com/qd.checks annotation to the pods.
+    enabled: false
+    # -- Datadog metric namespace (prefix).
+    namespace: qd
+    # -- Metrics to collect (regexes).
+    metrics: ["qd_.*"]
+    # -- Extra keys merged into the OpenMetrics instance config (e.g. {tags: ["team:x"]}).
+    extraInstanceConfig: {}
+
+# Prometheus alerting + recording rules as a prometheus-operator PrometheusRule (requires the
+# CRD). Rendered from files/prometheus-rules.yaml, a copy of deploy/observability/prometheus-rules.yaml.
+prometheusRule:
+  # -- Create the PrometheusRule.
+  enabled: false
+  # -- Namespace for the PrometheusRule (default: release namespace).
+  namespace: ""
+  # -- Extra labels, e.g. {release: kube-prometheus-stack} to match the Prometheus ruleSelector.
+  labels: {}
+  annotations: {}
+  # -- Regex for the `job` label of the scrape jobs (used by the `up`-based alerts). Empty = the
+  # ServiceMonitor's jobs, i.e. this release's server and scheduler Service names
+  # ("<fullname>" and "<fullname>-scheduler").
+  jobMatcher: ""
+  # -- Base URL the alerts' runbook_url annotations point to (anchors are appended).
+  runbookBaseUrl: https://gitlab.hexploits.cloud/hexploits/services/simply-queued/-/blob/main/docs/OPERATIONS.md
+  thresholds:
+    # -- QdServerErrorsHigh: ratio of InternalFailure/ServiceUnavailable responses (5m).
+    serverErrorRatioWarning: 0.01
+    # -- QdServerErrorsCritical.
+    serverErrorRatioCritical: 0.05
+    # -- QdHighLatency: p99 seconds of any action except ReceiveMessage.
+    latencyP99Seconds: 0.5
+    # -- QdDBPoolSaturated: in_use / max connections per replica.
+    dbPoolUtilization: 0.9
+    # -- QdJanitorFailing: failed janitor passes per replica in 15m.
+    janitorErrors15m: 2
+    # -- QdQueueMetricsCollectionSlow: p99 seconds of a queue-gauge collection.
+    queueMetricsCollectionSeconds: 20
+    # -- QdDeadLetterQueueNotEmpty: visible messages in a DLQ.
+    deadLetterQueueMessages: 0
+    # -- QdOldestMessageTooOld: seconds (DLQs excluded).
+    oldestMessageAgeSeconds: 3600
+    # -- QdBacklogGrowing: minimum visible messages for a growing backlog to alert.
+    backlogMessages: 1000
+    # -- QdSchedulerDown: age (s) of the freshest scheduler heartbeat seen by the servers.
+    schedulerHeartbeatAgeSeconds: 120
+  # -- Alert names to leave out, e.g. [QdVersionSkew].
+  disabledAlerts: []
+  # -- Per-alert severity overrides, e.g. {QdDeadLetterQueueNotEmpty: info}.
+  severityOverrides: {}
+  # -- Labels added to every alert (existing labels win), e.g. {team: platform}.
+  additionalAlertLabels: {}
+
+# Grafana dashboard as a ConfigMap picked up by the Grafana sidecar (kube-prometheus-stack /
+# grafana chart: sidecar.dashboards.enabled=true). Rendered from files/grafana-dashboard.json.
+grafanaDashboard:
+  # -- Create the dashboard ConfigMap.
+  enabled: false
+  # -- Namespace for the ConfigMap (default: release namespace; the sidecar must watch it).
+  namespace: ""
+  # -- Label the sidecar selects on (sidecar.dashboards.label).
+  sidecarLabel: grafana_dashboard
+  # -- Value of that label (sidecar.dashboards.labelValue).
+  sidecarLabelValue: "1"
+  labels: {}
+  annotations: {}
+  # -- Grafana folder (requires sidecar.dashboards.folderAnnotation); empty = default folder.
+  folder: ""
+  folderAnnotation: grafana_folder
+
+###############################################################################
+# NetworkPolicy (optional)
+###############################################################################
+networkPolicy:
+  enabled: false
+  # -- Peers allowed to reach the SQS port. Empty = from anywhere.
+  sqsFrom: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: my-app
+  # -- Peers allowed to reach the admin port of server and scheduler pods (kubelet probes are
+  # always allowed). Empty = anywhere.
+  adminFrom: []
+  #  - namespaceSelector:
+  #      matchLabels:
+  #        kubernetes.io/metadata.name: monitoring
+  egress:
+    # -- Also restrict egress to DNS + Postgres (all roles).
+    enabled: false
+    postgresPort: 5432
+    # -- Peers hosting Postgres. Empty = any destination on postgresPort.
+    postgresTo: []
+
+###############################################################################
+# PostgreSQL via CloudNativePG (https://cloudnative-pg.io). Requires the CNPG operator.
+###############################################################################
+postgresql:
+  cnpg:
+    # -- Create a CNPG `Cluster` and point QD_DATABASE_URL at its `<cluster>-app` Secret (key `uri`).
+    enabled: false
+    # -- Cluster name (default: <fullname>-pg).
+    name: ""
+    # -- Number of Postgres instances (1 primary + N-1 hot standbys). Keep >= 3 with synchronous
+    # replication so one standby can be lost without blocking writes.
+    instances: 3
+    # -- Postgres image (empty = operator default).
+    imageName: ""
+    database: qd
+    owner: qd
+    storage:
+      size: 20Gi
+      storageClass: ""
+    walStorage:
+      enabled: false
+      size: 10Gi
+      storageClass: ""
+    # -- Synchronous replication (quorum-based; needs CNPG >= 1.24, dataDurability >= 1.25).
+    # ON by default: SQS semantics mean an acknowledged SendMessage must survive a primary
+    # failover, which asynchronous streaming replication cannot guarantee (the last commits
+    # may not have reached the standby that gets promoted).
+    # Trade-off: with dataDurability=required, every commit waits for one standby, adding a
+    # network round trip to each write, and writes BLOCK while no standby is available (e.g.
+    # both standbys down or a 1-instance cluster). Set dataDurability: preferred to favour
+    # availability (CNPG then drops to async while no standby is healthy, so acknowledged
+    # messages can be lost if the primary fails in that window). Disable entirely with
+    # `--set postgresql.cnpg.synchronous=null`. `number` must be lower than `instances`.
+    synchronous:
+      method: any
+      number: 1
+      dataDurability: required
+    # -- postgresql.conf parameters tuned for a high-churn queue workload.
+    parameters:
+      max_connections: "400"
+      shared_buffers: "512MB"
+      effective_cache_size: "1536MB"
+      work_mem: "8MB"
+      maintenance_work_mem: "128MB"
+      wal_compression: "on"
+      checkpoint_timeout: "15min"
+      max_wal_size: "4GB"
+      # Queue tables are updated/deleted constantly: vacuum aggressively.
+      autovacuum_naptime: "10s"
+      autovacuum_vacuum_scale_factor: "0.02"
+      autovacuum_vacuum_insert_scale_factor: "0.05"
+      autovacuum_analyze_scale_factor: "0.02"
+      autovacuum_vacuum_cost_limit: "2000"
+      autovacuum_vacuum_cost_delay: "2ms"
+      idle_in_transaction_session_timeout: "60s"
+    resources:
+      requests:
+        cpu: 500m
+        memory: 2Gi
+      limits:
+        memory: 2Gi
+    # -- Create a PodMonitor for the Postgres instances (requires prometheus-operator).
+    enablePodMonitor: false
+    # -- Extra fields merged into the Cluster spec (backup, affinity, etc.).
+    extraSpec: {}
